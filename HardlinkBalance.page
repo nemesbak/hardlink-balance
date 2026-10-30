@@ -1,0 +1,795 @@
+Menu="Utilities MyFavorites"
+Title="Hardlink Balance"
+Tag="balance-scale"
+Icon="images/hardlink-balance.png"
+---
+<?php
+/* Hardlink Balance — Unraid Array Disk Usage Balancer with Hardlink Protection */
+$plugin  = "hardlink-balance";
+$docroot = $docroot ?? $_SERVER['DOCUMENT_ROOT'] ?: '/usr/local/emhttp';
+$var     = @parse_ini_file('/var/local/emhttp/var.ini') ?: [];
+$csrf    = $var['csrf_token'] ?? '';
+?>
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+/* ── Theme variables ─────────────────────────────────────────────────────── */
+:root {
+    --hl-bg:          #ffffff;
+    --hl-bg-alt:      #f8f9fa;
+    --hl-bg-card:     #ffffff;
+    --hl-border:      #e2e8f0;
+    --hl-text:        #1e293b;
+    --hl-text-muted:  #64748b;
+    --hl-accent:      #10b981;
+    --hl-cyan:        #06b6d4;
+    --hl-bar-track:   #e2e8f0;
+    --hl-bar-target:  #0f172a;
+    --hl-source:      #ef4444;
+    --hl-dest:        #10b981;
+    --hl-source-bg:   #fef2f2;
+    --hl-dest-bg:     #f0fdf4;
+    --hl-bal-bg:      #f8fafc;
+}
+
+.hl-dark {
+    --hl-bg:          #0f172a;
+    --hl-bg-alt:      #1e293b;
+    --hl-bg-card:     #1e293b;
+    --hl-border:      #334155;
+    --hl-text:        #f1f5f9;
+    --hl-text-muted:  #94a3b8;
+    --hl-accent:      #10b981;
+    --hl-cyan:        #38bdf8;
+    --hl-bar-track:   #334155;
+    --hl-bar-target:  #f8fafc;
+    --hl-source:      #f87171;
+    --hl-dest:        #34d399;
+    --hl-source-bg:   #451a1a;
+    --hl-dest-bg:     #064e3b;
+    --hl-bal-bg:      #1e293b;
+}
+
+/* ── Container styles ────────────────────────────────────────────────────── */
+#hl-wrap {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--hl-text);
+    margin: 15px 0 35px;
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+.hl-card {
+    background: var(--hl-bg-card);
+    border: 1px solid var(--hl-border);
+    border-radius: 8px;
+    padding: 18px 22px;
+    margin-bottom: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.hl-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--hl-border);
+    padding-bottom: 12px;
+    margin-bottom: 16px;
+}
+
+.hl-card-header h3 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.hl-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+.hl-badge-source { background: #fee2e2; color: #b91c1c; }
+.hl-badge-dest   { background: #dcfce7; color: #15803d; }
+.hl-badge-bal    { background: #f1f5f9; color: #475569; }
+.hl-badge-link   { background: #e0f2fe; color: #0369a1; }
+
+.hl-dark .hl-badge-source { background: #7f1d1d; color: #fca5a5; }
+.hl-dark .hl-badge-dest   { background: #064e3b; color: #86efac; }
+.hl-dark .hl-badge-bal    { background: #334155; color: #cbd5e1; }
+.hl-dark .hl-badge-link   { background: #0c4a6e; color: #7dd3fc; }
+
+/* ── Disk grid ───────────────────────────────────────────────────────────── */
+.hl-disk-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+.hl-disk-table th {
+    text-align: left;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: var(--hl-text-muted);
+    border-bottom: 1px solid var(--hl-border);
+}
+.hl-disk-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--hl-border);
+    vertical-align: middle;
+}
+.hl-bar-bg {
+    position: relative;
+    width: 100%;
+    height: 16px;
+    background: var(--hl-bar-track);
+    border-radius: 4px;
+    overflow: hidden;
+}
+.hl-bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.3s ease;
+}
+.hl-bar-target-line {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--hl-bar-target);
+    z-index: 2;
+}
+
+/* ── Controls ────────────────────────────────────────────────────────────── */
+.hl-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    align-items: center;
+}
+.hl-control-group {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.hl-control-group label {
+    font-weight: 500;
+    color: var(--hl-text);
+}
+.hl-select, .hl-input {
+    background: var(--hl-bg);
+    color: var(--hl-text);
+    border: 1px solid var(--hl-border);
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+}
+
+.hl-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 18px;
+    font-size: 13px;
+    font-weight: 600;
+    border-radius: 6px;
+    border: none;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+.hl-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+.hl-btn-analyze {
+    background: #0284c7;
+    color: #ffffff;
+}
+.hl-btn-analyze:hover:not(:disabled) { background: #0369a1; }
+
+.hl-btn-start {
+    background: #10b981;
+    color: #ffffff;
+}
+.hl-btn-start:hover:not(:disabled) { background: #059669; }
+
+.hl-btn-stop {
+    background: #ef4444;
+    color: #ffffff;
+}
+.hl-btn-stop:hover:not(:disabled) { background: #dc2626; }
+
+.hl-btn-clear {
+    background: transparent;
+    color: var(--hl-text-muted);
+    border: 1px solid var(--hl-border);
+}
+.hl-btn-clear:hover:not(:disabled) {
+    background: var(--hl-bg-alt);
+    color: var(--hl-text);
+}
+
+/* ── Stats cards ─────────────────────────────────────────────────────────── */
+.hl-stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 14px;
+    margin-top: 15px;
+}
+.hl-stat-box {
+    background: var(--hl-bg-alt);
+    border: 1px solid var(--hl-border);
+    border-radius: 6px;
+    padding: 12px 14px;
+}
+.hl-stat-title {
+    font-size: 12px;
+    color: var(--hl-text-muted);
+    margin-bottom: 4px;
+}
+.hl-stat-val {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--hl-text);
+}
+.hl-stat-sub {
+    font-size: 11px;
+    color: var(--hl-text-muted);
+    margin-top: 2px;
+}
+
+/* ── Table & Console ─────────────────────────────────────────────────────── */
+.hl-table-container {
+    max-height: 320px;
+    overflow-y: auto;
+    border: 1px solid var(--hl-border);
+    border-radius: 6px;
+}
+.hl-data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+.hl-data-table th {
+    position: sticky;
+    top: 0;
+    background: var(--hl-bg-alt);
+    color: var(--hl-text-muted);
+    padding: 8px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--hl-border);
+    font-weight: 600;
+}
+.hl-data-table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--hl-border);
+}
+
+.hl-console {
+    background: #090d16;
+    color: #a7f3d0;
+    font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+    font-size: 12px;
+    line-height: 1.4;
+    padding: 12px;
+    border-radius: 6px;
+    max-height: 250px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+/* ── Banners ─────────────────────────────────────────────────────────────── */
+.hl-banner {
+    padding: 12px 16px;
+    border-radius: 6px;
+    margin-bottom: 18px;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.hl-banner-info    { background: #e0f2fe; color: #0369a1; border-left: 4px solid #0284c7; }
+.hl-banner-success { background: #dcfce7; color: #15803d; border-left: 4px solid #10b981; }
+.hl-banner-warn    { background: #fef3c7; color: #92400e; border-left: 4px solid #f59e0b; }
+.hl-banner-err     { background: #fee2e2; color: #991b1b; border-left: 4px solid #ef4444; }
+
+.hl-dark .hl-banner-info    { background: #0c4a6e; color: #bae6fd; }
+.hl-dark .hl-banner-success { background: #064e3b; color: #a7f3d0; }
+.hl-dark .hl-banner-warn    { background: #78350f; color: #fde68a; }
+.hl-dark .hl-banner-err     { background: #7f1d1d; color: #fecaca; }
+</style>
+</head>
+<body>
+<div id="hl-wrap">
+
+  <!-- Status Banner -->
+  <div id="hl-banner" style="display:none;" class="hl-banner"></div>
+
+  <!-- Disk Usage Section -->
+  <div class="hl-card">
+    <div class="hl-card-header">
+      <h3><i class="fa fa-hdd-o"></i> Array Disk Distribution</h3>
+      <div id="hl-target-label" style="font-size:13px;color:var(--hl-text-muted);">
+        Target: <b id="hl-target-val">--%</b> (±<span id="hl-tol-val">2</span>%)
+      </div>
+    </div>
+    <div style="overflow-x:auto;">
+      <table class="hl-disk-table">
+        <thead>
+          <tr>
+            <th style="width:110px;">Disk</th>
+            <th style="width:100px;">Status</th>
+            <th>Usage</th>
+            <th style="width:70px;text-align:right;">%</th>
+            <th style="width:170px;text-align:right;">Used / Total</th>
+            <th style="width:120px;text-align:right;">Free Space</th>
+          </tr>
+        </thead>
+        <tbody id="hl-disk-rows">
+          <tr><td colspan="6" style="text-align:center;color:var(--hl-text-muted);">Loading disks...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Configuration and Action Controls -->
+  <div class="hl-card">
+    <div class="hl-card-header">
+      <h3><i class="fa fa-sliders"></i> Balancer Controls</h3>
+      <div id="hl-engine-note" style="font-size:12px;color:var(--hl-accent);">
+        <i class="fa fa-link"></i> Hardlink-Safe Engine Active
+      </div>
+    </div>
+    
+    <div class="hl-controls">
+      <div class="hl-control-group">
+        <label for="hl-tolerance">Tolerance:</label>
+        <select id="hl-tolerance" class="hl-select">
+          <option value="1">± 1%</option>
+          <option value="2" selected>± 2% (Recommended)</option>
+          <option value="3">± 3%</option>
+          <option value="5">± 5%</option>
+          <option value="10">± 10%</option>
+        </select>
+      </div>
+
+      <div class="hl-control-group">
+        <label for="hl-min-size">Min File Size:</label>
+        <select id="hl-min-size" class="hl-select">
+          <option value="0">All Files (0 MB)</option>
+          <option value="10240">10 MB</option>
+          <option value="102400" selected>100 MB (Media files)</option>
+          <option value="512000">500 MB (Large videos)</option>
+          <option value="1048576">1 GB</option>
+        </select>
+      </div>
+
+      <div class="hl-control-group">
+        <label for="hl-limit-gb">Batch Limit:</label>
+        <select id="hl-limit-gb" class="hl-select">
+          <option value="0" selected>No Limit (Full Plan)</option>
+          <option value="25">25 GB (Small test)</option>
+          <option value="50">50 GB (Safe test)</option>
+          <option value="100">100 GB</option>
+          <option value="250">250 GB</option>
+          <option value="500">500 GB</option>
+        </select>
+      </div>
+    </div>
+
+    <div style="margin-top:18px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+      <button id="btn-analyze" class="hl-btn hl-btn-analyze" onclick="startRun(true)">
+        <i class="fa fa-search"></i> Start Analysis (Dry Run)
+      </button>
+      <button id="btn-execute" class="hl-btn hl-btn-start" onclick="startRun(false)">
+        <i class="fa fa-play"></i> Balance Array (Execute)
+      </button>
+      <button id="btn-stop" class="hl-btn hl-btn-stop" onclick="stopRun()" disabled>
+        <i class="fa fa-stop"></i> Stop
+      </button>
+      <button id="btn-clear" class="hl-btn hl-btn-clear" onclick="clearResults()" style="display:none;">
+        <i class="fa fa-trash-o"></i> Clear Results
+      </button>
+      <span id="hl-running-spinner" style="display:none;color:var(--hl-accent);font-size:13px;">
+        <i class="fa fa-circle-o-notch fa-spin"></i> <span id="hl-spinner-text">Processing...</span>
+      </span>
+    </div>
+  </div>
+
+  <!-- Statistics Panel -->
+  <div class="hl-card" id="hl-stats-card" style="display:none;">
+    <div class="hl-card-header">
+      <h3><i class="fa fa-pie-chart"></i> Operation Statistics</h3>
+      <span id="hl-op-badge" class="hl-badge hl-badge-bal">IDLE</span>
+    </div>
+
+    <!-- Overall Progress Bar -->
+    <div style="margin-bottom:12px;">
+      <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">
+        <span id="hl-prog-label">Progress</span>
+        <span id="hl-prog-pct" style="font-weight:700;">0%</span>
+      </div>
+      <div class="hl-bar-bg" style="height:12px;">
+        <div id="hl-prog-fill" class="hl-bar-fill" style="width:0%;background:var(--hl-accent);"></div>
+      </div>
+    </div>
+
+    <div class="hl-stats-grid">
+      <div class="hl-stat-box">
+        <div class="hl-stat-title">File Groups Moved</div>
+        <div class="hl-stat-val" id="st-groups-done">0</div>
+        <div class="hl-stat-sub" id="st-groups-total">of 0 planned</div>
+      </div>
+
+      <div class="hl-stat-box">
+        <div class="hl-stat-title">Data Transferred</div>
+        <div class="hl-stat-val" id="st-bytes-done">0 GB</div>
+        <div class="hl-stat-sub" id="st-bytes-total">of 0 GB total</div>
+      </div>
+
+      <div class="hl-stat-box" style="border:1px solid #10b981;background:rgba(16,185,129,0.08);">
+        <div class="hl-stat-title" style="color:var(--hl-accent);font-weight:600;">
+          <i class="fa fa-link"></i> Hardlinks Preserved
+        </div>
+        <div class="hl-stat-val" id="st-links-groups" style="color:var(--hl-accent);">0</div>
+        <div class="hl-stat-sub" id="st-links-size">0 GB in multi-link files</div>
+      </div>
+
+      <div class="hl-stat-box">
+        <div class="hl-stat-title">Transfer Speed</div>
+        <div class="hl-stat-val" id="st-speed">-- MB/s</div>
+        <div class="hl-stat-sub">Rsync native stream</div>
+      </div>
+
+      <div class="hl-stat-box">
+        <div class="hl-stat-title">Elapsed Time</div>
+        <div class="hl-stat-val" id="st-elapsed">00:00:00</div>
+        <div class="hl-stat-sub" id="st-eta">ETA: --</div>
+      </div>
+
+      <div class="hl-stat-box">
+        <div class="hl-stat-title">Errors / Skipped</div>
+        <div class="hl-stat-val" id="st-failed">0</div>
+        <div class="hl-stat-sub">Integrity verified</div>
+      </div>
+    </div>
+
+    <div id="hl-curr-file-wrap" style="margin-top:14px;font-size:12px;color:var(--hl-text-muted);display:none;">
+      <b>Current File:</b> <span id="hl-curr-file" style="font-family:monospace;">--</span>
+    </div>
+  </div>
+
+  <!-- Move Plan Table -->
+  <div class="hl-card" id="hl-plan-card" style="display:none;">
+    <div class="hl-card-header">
+      <h3>
+        <i class="fa fa-list-alt"></i> Transfer Plan 
+        <span id="hl-plan-total-items" style="font-size:12px;color:var(--hl-text-muted);font-weight:normal;"></span>
+      </h3>
+    </div>
+    <div class="hl-table-container">
+      <table class="hl-data-table">
+        <thead>
+          <tr>
+            <th style="width:130px;">Route</th>
+            <th>File Path</th>
+            <th style="width:100px;">Size</th>
+            <th style="width:130px;">Hardlink Protection</th>
+          </tr>
+        </thead>
+        <tbody id="hl-plan-rows"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Live Log Console -->
+  <div class="hl-card">
+    <div class="hl-card-header">
+      <h3><i class="fa fa-terminal"></i> Activity Log</h3>
+      <button class="hl-btn hl-btn-clear" style="padding:2px 8px;font-size:11px;" onclick="pollNow()">
+        <i class="fa fa-refresh"></i> Refresh
+      </button>
+    </div>
+    <div id="hl-console" class="hl-console">Waiting for activity...</div>
+  </div>
+
+</div>
+
+<script>
+const ENDPOINT = '/plugins/hardlink-balance/scripts/status.php';
+let pollTimer = null;
+let lastState = 'idle';
+
+// Dark mode detection to match Unraid theme
+function checkTheme() {
+    const wrap = document.getElementById('hl-wrap');
+    const isDark = document.body.classList.contains('dark') || 
+                   window.matchMedia('(prefers-color-scheme: dark)').matches ||
+                   document.documentElement.getAttribute('data-theme') === 'dark';
+    if (isDark) {
+        wrap.classList.add('hl-dark');
+    } else {
+        wrap.classList.remove('hl-dark');
+    }
+}
+checkTheme();
+
+function fmtKB(kb) {
+    if (!kb || kb <= 0) return '0 KB';
+    if (kb >= 1024 * 1024 * 1024) return (kb / (1024*1024*1024)).toFixed(2) + ' TB';
+    if (kb >= 1024 * 1024) return (kb / (1024*1024)).toFixed(2) + ' GB';
+    if (kb >= 1024) return (kb / 1024).toFixed(1) + ' MB';
+    return kb + ' KB';
+}
+
+function fmtSec(s) {
+    if (!s || s <= 0) return '00:00:00';
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = Math.floor(s % 60);
+    return [h, m, sec].map(v => v < 10 ? '0' + v : v).join(':');
+}
+
+function renderDisks(disks, targetPct, tol) {
+    const tbody = document.getElementById('hl-disk-rows');
+    if (!disks || disks.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;">No disks found</td></tr>';
+        return;
+    }
+    document.getElementById('hl-target-val').textContent = targetPct + '%';
+    document.getElementById('hl-tol-val').textContent = tol;
+
+    let html = '';
+    for (const d of disks) {
+        let badgeClass = 'hl-badge-bal';
+        let badgeText  = 'BALANCED';
+        let barColor   = '#3b82f6';
+
+        if (d.role === 'source') {
+            badgeClass = 'hl-badge-source';
+            badgeText  = 'SOURCE';
+            barColor   = '#ef4444';
+        } else if (d.role === 'destination') {
+            badgeClass = 'hl-badge-dest';
+            badgeText  = 'DEST';
+            barColor   = '#10b981';
+        }
+
+        html += `<tr>
+            <td><b>${d.name}</b></td>
+            <td><span class="hl-badge ${badgeClass}">${badgeText}</span></td>
+            <td>
+                <div class="hl-bar-bg">
+                    <div class="hl-bar-fill" style="width:${Math.min(100, d.pct)}%;background:${barColor};"></div>
+                    <div class="hl-bar-target-line" style="left:${targetPct}%;" title="Target: ${targetPct}%"></div>
+                </div>
+            </td>
+            <td style="text-align:right;font-weight:600;">${d.pct}%</td>
+            <td style="text-align:right;font-size:12px;">${fmtKB(d.used_kb)} / ${fmtKB(d.size_kb)}</td>
+            <td style="text-align:right;font-size:12px;color:var(--hl-text-muted);">${fmtKB(d.free_kb)}</td>
+        </tr>`;
+    }
+    tbody.innerHTML = html;
+}
+
+function renderPlan(plan, totalCount) {
+    const card = document.getElementById('hl-plan-card');
+    const tbody = document.getElementById('hl-plan-rows');
+    const label = document.getElementById('hl-plan-total-items');
+
+    if (!plan || plan.length === 0) {
+        card.style.display = 'none';
+        return;
+    }
+    card.style.display = 'block';
+    label.textContent = `(Showing top ${plan.length} of ${totalCount || plan.length} planned moves)`;
+
+    let html = '';
+    for (const p of plan) {
+        const linkBadge = p.links > 1
+            ? `<span class="hl-badge hl-badge-dest"><i class="fa fa-link"></i> ${p.links} links</span>`
+            : `<span class="hl-badge hl-badge-bal">1 file</span>`;
+
+        html += `<tr>
+            <td><b>${p.src_disk}</b> <i class="fa fa-arrow-right" style="color:var(--hl-text-muted);font-size:10px;"></i> <b>${p.dst_disk}</b></td>
+            <td style="word-break:break-all;font-family:monospace;font-size:12px;">${escHtml(p.path)}</td>
+            <td>${fmtKB(p.size_kb)}</td>
+            <td>${linkBadge}</td>
+        </tr>`;
+    }
+    tbody.innerHTML = html;
+}
+
+function renderLog(lines) {
+    const box = document.getElementById('hl-console');
+    if (!lines || lines.length === 0) return;
+    box.textContent = lines.join('\n');
+    box.scrollTop = box.scrollHeight;
+}
+
+function showBanner(type, html) {
+    const b = document.getElementById('hl-banner');
+    b.className = 'hl-banner hl-banner-' + type;
+    b.innerHTML = html;
+    b.style.display = 'flex';
+}
+
+function hideBanner() {
+    document.getElementById('hl-banner').style.display = 'none';
+}
+
+function escHtml(s) {
+    if (!s) return '';
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function setButtons(state) {
+    const btnAn = document.getElementById('btn-analyze');
+    const btnEx = document.getElementById('btn-execute');
+    const btnSt = document.getElementById('btn-stop');
+    const btnCl = document.getElementById('btn-clear');
+    const spin  = document.getElementById('hl-running-spinner');
+    const spinT = document.getElementById('hl-spinner-text');
+
+    const running = (state === 'running' || state === 'starting' || state === 'planning');
+
+    btnAn.disabled = running;
+    btnEx.disabled = running;
+    btnSt.disabled = !running;
+    btnCl.style.display = (!running && state !== 'idle') ? 'inline-flex' : 'none';
+
+    if (running) {
+        spin.style.display = 'inline-block';
+        spinT.textContent = state === 'planning' ? 'Analyzing files & calculating groups...' : 'Balancing array data...';
+    } else {
+        spin.style.display = 'none';
+    }
+}
+
+function applyStatus(data) {
+    const state = data.state || 'idle';
+    lastState = state;
+    setButtons(state);
+
+    const tol = data.tolerance || parseInt(document.getElementById('hl-tolerance').value);
+    const targetPct = data.target_pct || 0;
+    renderDisks(data.disks, targetPct, tol);
+    renderLog(data.log);
+
+    const statsCard = document.getElementById('hl-stats-card');
+    const stats = data.stats || {};
+
+    if (state !== 'idle') {
+        statsCard.style.display = 'block';
+        const badge = document.getElementById('hl-op-badge');
+        badge.textContent = state.toUpperCase();
+        badge.className = 'hl-badge ' + (state === 'running' ? 'hl-badge-source' : (state === 'completed' ? 'hl-badge-dest' : 'hl-badge-bal'));
+
+        const totalKB = stats.bytes_total_kb || 0;
+        const doneKB  = stats.bytes_done_kb  || 0;
+        const pct = totalKB > 0 ? ((doneKB * 100) / totalKB).toFixed(1) : (state === 'completed' ? 100 : 0);
+
+        document.getElementById('hl-prog-pct').textContent = pct + '%';
+        document.getElementById('hl-prog-fill').style.width = pct + '%';
+
+        document.getElementById('st-groups-done').textContent = stats.files_done || 0;
+        document.getElementById('st-groups-total').textContent = `of ${stats.files_total || data.plan_count || 0} planned`;
+
+        document.getElementById('st-bytes-done').textContent = fmtKB(doneKB);
+        document.getElementById('st-bytes-total').textContent = `of ${fmtKB(totalKB)} total`;
+
+        document.getElementById('st-links-groups').textContent = stats.multi_linked_groups || 0;
+        document.getElementById('st-links-size').textContent = `${fmtKB(stats.multi_linked_kb || 0)} preserved`;
+
+        const speedKbs = stats.rate_kbs || 0;
+        document.getElementById('st-speed').textContent = speedKbs > 0 ? (speedKbs / 1024).toFixed(1) + ' MB/s' : '-- MB/s';
+
+        document.getElementById('st-elapsed').textContent = fmtSec(data.elapsed_sec || 0);
+        document.getElementById('st-eta').textContent = stats.eta_sec > 0 ? 'ETA: ' + fmtSec(stats.eta_sec) : (state === 'completed' ? 'Done' : 'ETA: --');
+
+        document.getElementById('st-failed').textContent = stats.files_skipped || 0;
+
+        const currWrap = document.getElementById('hl-curr-file-wrap');
+        const currFile = document.getElementById('hl-curr-file');
+        if (data.current_file) {
+            currWrap.style.display = 'block';
+            currFile.textContent = data.current_file;
+        } else {
+            currWrap.style.display = 'none';
+        }
+
+        renderPlan(data.plan, data.plan_count);
+
+        if (state === 'planned') {
+            showBanner('info', `<i class="fa fa-info-circle"></i> <b>Analysis Complete:</b> Found ${data.plan_count} groups (${fmtKB(totalKB)}). Review the plan below and click "Balance Array" to execute.`);
+        } else if (state === 'completed') {
+            showBanner('success', `<i class="fa fa-check-circle"></i> <b>Operation Finished:</b> Transferred ${fmtKB(doneKB)} across ${stats.files_done} groups with full hardlink preservation.`);
+        } else if (state === 'stopped') {
+            showBanner('warn', `<i class="fa fa-exclamation-triangle"></i> <b>Stopped by user:</b> Execution halted cleanly. Zero partial or broken files created.`);
+        } else if (state === 'error') {
+            showBanner('err', `<i class="fa fa-times-circle"></i> <b>Error:</b> ${escHtml(data.msg || 'An error occurred during execution')}`);
+        } else {
+            hideBanner();
+        }
+    } else {
+        statsCard.style.display = 'none';
+        document.getElementById('hl-plan-card').style.display = 'none';
+        hideBanner();
+    }
+}
+
+function pollNow() {
+    const tol = document.getElementById('hl-tolerance').value;
+    fetch(ENDPOINT + '?tolerance=' + tol)
+        .then(r => r.json())
+        .then(data => {
+            applyStatus(data);
+            const running = (data.state === 'running' || data.state === 'starting' || data.state === 'planning');
+            if (running) {
+                if (!pollTimer) pollTimer = setTimeout(pollNow, 1200);
+            } else {
+                if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+            }
+        })
+        .catch(err => console.error('Poll error:', err));
+}
+
+function startRun(isDryRun) {
+    const tol = document.getElementById('hl-tolerance').value;
+    const minSize = document.getElementById('hl-min-size').value;
+    const limitGb = document.getElementById('hl-limit-gb').value;
+
+    const body = new URLSearchParams();
+    body.append('action', 'start');
+    body.append('tolerance', tol);
+    body.append('dry_run', isDryRun ? '1' : '');
+    body.append('min_file_kb', minSize);
+    body.append('limit_gb', limitGb);
+
+    setButtons(isDryRun ? 'planning' : 'starting');
+
+    fetch(ENDPOINT, { method: 'POST', body: body })
+        .then(r => r.json())
+        .then(res => {
+            if (!res.success) {
+                alert('Could not start: ' + (res.msg || 'Unknown error'));
+            }
+            pollNow();
+        })
+        .catch(err => {
+            alert('Request error: ' + err);
+            pollNow();
+        });
+}
+
+function stopRun() {
+    if (!confirm('Are you sure you want to stop balancing? Ongoing group will safely finish before stopping.')) return;
+    const body = new URLSearchParams();
+    body.append('action', 'stop');
+
+    fetch(ENDPOINT, { method: 'POST', body: body })
+        .then(r => r.json())
+        .then(() => pollNow())
+        .catch(err => console.error(err));
+}
+
+function clearResults() {
+    const body = new URLSearchParams();
+    body.append('action', 'clear');
+
+    fetch(ENDPOINT, { method: 'POST', body: body })
+        .then(r => r.json())
+        .then(() => pollNow())
+        .catch(err => console.error(err));
+}
+
+// Initial fetch on page load
+pollNow();
+</script>
+</body>
+</html>

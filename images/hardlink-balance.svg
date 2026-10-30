@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Background circle -->
+  <circle cx="32" cy="32" r="30" fill="#111827" stroke="#10b981" stroke-width="2"/>
+  <!-- Pivot post -->
+  <rect x="30.5" y="14" width="3" height="34" rx="1.5" fill="#e5e7eb"/>
+  <!-- Base -->
+  <rect x="20" y="48" width="24" height="3.5" rx="1.75" fill="#e5e7eb"/>
+  <!-- Beam -->
+  <rect x="12" y="19" width="40" height="3" rx="1.5" fill="#f3f4f6"/>
+  <!-- Left chain -->
+  <line x1="16" y1="22" x2="16" y2="33" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="2,1.5"/>
+  <!-- Right chain -->
+  <line x1="48" y1="22" x2="48" y2="33" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="2,1.5"/>
+  <!-- Left pan -->
+  <path d="M9 35 Q16 41 23 35 Z" fill="#0284c7" stroke="#38bdf8" stroke-width="1.2"/>
+  <!-- Right pan -->
+  <path d="M41 35 Q48 41 55 35 Z" fill="#0284c7" stroke="#38bdf8" stroke-width="1.2"/>
+  <!-- Central Hardlink Ring / Link Badge -->
+  <circle cx="32" cy="31" r="5" fill="none" stroke="#10b981" stroke-width="2.5"/>
+  <circle cx="32" cy="31" r="2" fill="#10b981"/>
+</svg>

@@ -1,0 +1,75 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+  <!ENTITY name       "hardlink-balance">
+  <!ENTITY author     "nemes">
+  <!ENTITY version    "2026.10.30">
+  <!ENTITY pluginURL  "https://raw.githubusercontent.com/nemesbak/hardlink-balance/main/hardlink_balance.plg">
+  <!ENTITY pluginDir  "/usr/local/emhttp/plugins/&name;">
+  <!ENTITY emhttpDir  "/usr/local/emhttp/plugins/&name;">
+  <!ENTITY bootDir    "/boot/config/plugins/&name;">
+]>
+
+<PLUGIN
+  name="&name;"
+  author="&author;"
+  version="&version;"
+  pluginURL="&pluginURL;"
+  min="6.12"
+  icon="/plugins/&name;/images/hardlink-balance.png"
+  support="https://github.com/nemesbak/hardlink-balance/issues"
+>
+
+<CHANGES>
+##2026.10.30
+- Initial official release of Hardlink Balance for Unraid.
+- Hardlink-safe balancer engine grouping by (st_dev, st_ino) to prevent split torrent/media links.
+- Interactive WebGUI dashboard integrated under Tools / Utilities in Unraid.
+- Real-time disk utilization bars with source/destination/balanced indicators.
+- Live progress, transfer speed, elapsed time, and ETA calculations.
+- Hardlink preservation metrics card showing exact groups and GB preserved.
+- Tolerance, minimum file size, and batch limit controls.
+- Integration with Unraid nobody:users (99:100) permission rules to prevent Permission Denied errors.
+- Support for ZFS child datasets (e.g. /mnt/diskN/datos).
+</CHANGES>
+
+<!-- ── Step 1: Create plugin directories ──────────────────────────────────── -->
+<FILE Run="/bin/bash">
+<INLINE>
+mkdir -p &pluginDir;/scripts
+mkdir -p &pluginDir;/images
+mkdir -p &bootDir;/runs
+echo "Directories created for &name;."
+</INLINE>
+</FILE>
+
+<!-- ── Step 2: Post-install setup ─────────────────────────────────────────── -->
+<FILE Run="/bin/bash">
+<INLINE>
+chmod +x &pluginDir;/scripts/hardlink_balance.py
+chmod 644 &pluginDir;/scripts/status.php
+chmod 644 &pluginDir;/HardlinkBalance.page
+
+echo ""
+echo "-----------------------------------------------------------"
+echo " &name; has been installed successfully!"
+echo " Access it via: Tools → Hardlink Balance"
+echo "-----------------------------------------------------------"
+echo ""
+</INLINE>
+</FILE>
+
+<!-- ── Removal handler ────────────────────────────────────────────────────── -->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+# Stop any ongoing operation
+if [[ -f /tmp/hardlink_balance.lock ]]; then
+    kill "$(cat /tmp/hardlink_balance.lock)" 2>/dev/null
+    rm -f /tmp/hardlink_balance.lock
+fi
+
+rm -rf &pluginDir;
+echo "&name; has been removed."
+</INLINE>
+</FILE>
+
+</PLUGIN>
