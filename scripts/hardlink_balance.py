@@ -35,6 +35,8 @@ LOG_FILE = "/var/log/hardlink_balance.log"
 STATUS_FILE = "/tmp/hardlink_balance_status.json"
 PLAN_FILE = "/tmp/hardlink_balance_plan.json"
 CFG_FILE = "/boot/config/plugins/hardlink-balance/hardlink-balance.cfg"
+SHARES_CFG_DIR = "/boot/config/shares"      # per-share shareInclude / shareExclude
+LOG_MAX_BYTES = 5 * 1024 * 1024             # /var/log is a small tmpfs: rotate to .1
 
 # Defaults, overridable in CFG_FILE (KEY="value" lines)
 CFG = {
@@ -71,6 +73,41 @@ def _handle_sigterm(signum, frame):
 
 signal.signal(signal.SIGTERM, _handle_sigterm)
 signal.signal(signal.SIGINT, _handle_sigterm)
+
+
+def pid_is_us(pid):
+    """True if pid is alive AND is a hardlink_balance process (pids get reused)."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return b"hardlink_balance" in f.read()
+    except OSError:
+        return False
+
+
+def fsync_path(path, directory=False):
+    """Flush a file (or a directory entry) to disk. Without it, a power cut right after
+    removing the source could lose both copies (XFS keeps fresh data in RAM for seconds)."""
+    fd = os.open(path, os.O_RDONLY | (os.O_DIRECTORY if directory else 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def share_allowed_disks(share, all_disks):
+    """Disks a share may live on, from Unraid's shareInclude / shareExclude (empty = all)."""
+    vals = {}
+    try:
+        with open(os.path.join(SHARES_CFG_DIR, share + ".cfg")) as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    vals[k.strip()] = v.strip().strip('"')
+    except OSError:
+        return set(all_disks)
+    inc = {x.strip() for x in vals.get("shareInclude", "").split(",") if x.strip()}
+    exc = {x.strip() for x in vals.get("shareExclude", "").split(",") if x.strip()}
+    return {d for d in all_disks if (not inc or d in inc) and d not in exc}
 
 
 def load_cfg():
@@ -160,6 +197,11 @@ def log(msg):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line, flush=True)
+    try:
+        if os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            os.replace(LOG_FILE, LOG_FILE + ".1")
+    except OSError:
+        pass
     try:
         with open(LOG_FILE, "a") as f:
             f.write(line + "\n")
@@ -400,6 +442,19 @@ def scan_disk_units(mount, min_size_kb, min_age_s, exclude_dirs=None):
     return out, dict(skipped)
 
 
+def clean_stale_temps(mount):
+    """Remove .hlb-tmp leftovers of a crashed run anywhere on a disk (we hold the lock)."""
+    for root, dirs, files in os.walk(mount):
+        dirs[:] = [d for d in dirs if d not in DEFAULT_EXCLUDE_DIRS]
+        for name in files:
+            if name.endswith(TMP_SUFFIX):
+                try:
+                    os.remove(os.path.join(root, name))
+                    log(f"  removed stale temp file {os.path.join(root, name)}")
+                except OSError:
+                    pass
+
+
 def build_plan(disks, tolerance, min_size_kb, min_age_s, limit_kb=None, run_start0=None):
     total_size = sum(d["size_kb"] for d in disks.values())
     total_used = sum(d["used_kb"] for d in disks.values())
@@ -422,6 +477,7 @@ def build_plan(disks, tolerance, min_size_kb, min_age_s, limit_kb=None, run_star
     plan = []
     plan_total_kb = 0
     limit_hit = False
+    share_cache = {}
 
     for src_idx, src in enumerate(sources):
         if limit_hit:
@@ -462,10 +518,15 @@ def build_plan(disks, tolerance, min_size_kb, min_age_s, limit_kb=None, run_star
                 continue
 
             rels = [rel_to_mount(p, s["mount"]) for g in u["groups"] for p in g["paths"]]
+            allowed = set(vstate)
+            for share in {r.split(os.sep, 1)[0] for r in rels}:
+                if share not in share_cache:
+                    share_cache[share] = share_allowed_disks(share, vstate)
+                allowed &= share_cache[share]
             best = None
             for dname, d in vstate.items():
-                if dname == src:
-                    continue
+                if dname == src or dname not in allowed:
+                    continue                # never put a share on a disk it excludes
                 if any(os.path.lexists(os.path.join(d["mount"], r)) for r in rels):
                     continue        # same path already on that disk: would collide
                 if d["free_kb"] - size_kb < MIN_FREE_HEADROOM_KB:
@@ -633,6 +694,13 @@ def execute_group(group, disks):
         log(f"  ERROR size mismatch {tmp}: {copied} != {group['size']}")
         return "skipped", rel_primary
 
+    try:
+        fsync_path(tmp)
+    except OSError as e:
+        _rm([tmp])
+        log(f"  ERROR fsync {tmp}: {e}")
+        return "skipped", rel_primary
+
     why = _source_unchanged(group)
     if why:
         _rm([tmp])
@@ -650,6 +718,13 @@ def execute_group(group, disks):
         log(f"  ERROR linking {e.filename}: {e.strerror}")
         return "skipped", rel_primary
     _rm([tmp])
+    try:
+        for dd in {os.path.dirname(dp) for dp in dst_all}:
+            fsync_path(dd, directory=True)   # new names are on disk before the source goes
+    except OSError as e:
+        log(f"  ERROR fsync dir: {e} — keeping the source, copy stays on {group['dst_disk']}")
+        _rm(made)
+        return "skipped", rel_primary
 
     failed_rm = []
     for p in paths:
@@ -674,12 +749,16 @@ def main():
     ap.add_argument("--limit-gb", type=float, default=None, help="cap total plan size (for a safe test run)")
     ap.add_argument("--exclude-disks", type=str, default="", help="comma-separated disk names to exclude (e.g. disk8)")
     ap.add_argument("--mnt-root", type=str, default="/mnt", help=argparse.SUPPRESS)  # tests
+    ap.add_argument("--shares-cfg-dir", type=str, default=None, help=argparse.SUPPRESS)  # tests
     ap.add_argument("--headroom-mb", type=int, default=None, help=argparse.SUPPRESS)  # tests
     ap.add_argument("--execute", action="store_true", help="actually move data (default is dry-run)")
     ap.add_argument("--dry-run", action="store_true", help="dry-run only (default)")
     ap.add_argument("--stop", action="store_true", help="stop currently running instance")
     args = ap.parse_args()
     load_cfg()
+    if args.shares_cfg_dir:
+        global SHARES_CFG_DIR
+        SHARES_CFG_DIR = args.shares_cfg_dir
     if args.headroom_mb is not None:
         global MIN_FREE_HEADROOM_KB
         MIN_FREE_HEADROOM_KB = args.headroom_mb * 1024
@@ -707,9 +786,9 @@ def main():
         try:
             with open(LOCK_FILE) as f:
                 pid = int(f.read().strip())
-            os.kill(pid, 0)
-            log(f"Already running (PID {pid}), exiting.")
-            sys.exit(1)
+            if pid_is_us(pid):
+                log(f"Already running (PID {pid}), exiting.")
+                sys.exit(1)
         except (OSError, ValueError):
             pass
     with open(LOCK_FILE, "w") as f:
@@ -799,6 +878,8 @@ def main():
             log("DRY RUN — no data was moved. Re-run with --execute to apply this plan.")
             return
 
+        for name in disks:                  # leftovers of a crash may sit on any disk
+            clean_stale_temps(disks[name]["mount"])
         log("EXECUTING plan...")
         done = 0
         failed = 0

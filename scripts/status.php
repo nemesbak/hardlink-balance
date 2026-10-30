@@ -17,10 +17,11 @@ define('LOCK_FILE',   '/tmp/hardlink_balance.lock');
 define('LOG_FILE',    '/var/log/hardlink_balance.log');
 define('SCRIPT',      '/usr/local/emhttp/plugins/hardlink-balance/scripts/hardlink_balance.py');
 
+/** Alive AND really our engine (pids get reused after a reboot or crash). */
 function pid_alive(int $pid): bool {
     if ($pid <= 0) return false;
-    if (function_exists('posix_kill')) return posix_kill($pid, 0);
-    return file_exists("/proc/$pid");
+    $cmd = @file_get_contents("/proc/$pid/cmdline");
+    return $cmd !== false && strpos($cmd, 'hardlink_balance') !== false;
 }
 
 function is_running(): bool {
@@ -219,7 +220,7 @@ $var = @parse_ini_file('/var/local/emhttp/var.ini') ?: [];
 $csrf_expected = $var['csrf_token'] ?? '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (!empty($csrf_expected) && ($_POST['csrf_token'] ?? '') !== $csrf_expected) {
+    if ($csrf_expected === '' || !hash_equals($csrf_expected, (string)($_POST['csrf_token'] ?? ''))) {
         json_out(['success' => false, 'msg' => 'Invalid CSRF token']);
         exit;
     }
