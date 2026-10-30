@@ -3,14 +3,18 @@
 hardlink_balance.py / EquiLink — Unraid array disk balancer with hardlink protection.
 
 Features & Guarantees:
-  1. Inode-Aware Grouping: groups by (st_dev, st_ino) on each source disk.
-  2. Single-Pass Transfer: copies primary file via rsync, recreates secondary
-     paths via native hardlinks (os.link) on destination.
-  3. Collision Prevention: never overwrites files if destination paths already exist.
-  4. Concurrent Modification Guard: detects if files are modified mid-transfer.
-  5. Nobody:Users (99:100) 775 Permissions: prevents permission errors in qBittorrent/media servers.
-  6. Empty Parent Directory Cleanup: automatically prunes empty folder trees on source disks.
-  7. ZFS & XFS child dataset support: accurate capacity reporting for ZFS datasets.
+  1. Inode-Aware Grouping: groups by (st_dev, st_ino) on each source disk and only
+     moves a group when ALL its links were found (st_nlink == paths found).
+  2. Folder Units: files are planned per folder (season / movie folder, chosen from
+     the deepest link, i.e. the library side), so folders are not scattered.
+  3. Safe Copy: rsync to a hidden temp name, verify size, then publish with a
+     no-clobber link. A crash never leaves a half file under the real name.
+  4. Active-File Guard: skips folders with files modified/linked recently, files
+     open for writing by any process (qBittorrent, *arr, shfs...) and partial
+     downloads (.!qB, .part...). Everything is re-checked right before deleting.
+  5. Busy Guard: refuses to run during Mover, parity check/rebuild or unBALANCE.
+  6. Nobody:Users (99:100) 775 on new folders; empty source folders are pruned.
+  7. XFS / BTRFS / ZFS: ZFS disks report pool capacity (child datasets included).
 """
 
 import argparse
@@ -30,7 +34,14 @@ LOCK_FILE = "/tmp/hardlink_balance.lock"
 LOG_FILE = "/var/log/hardlink_balance.log"
 STATUS_FILE = "/tmp/hardlink_balance_status.json"
 PLAN_FILE = "/tmp/hardlink_balance_plan.json"
-RUNS_DIR = "/mnt/user/appdata/scripts/hardlink_balance_runs"
+CFG_FILE = "/boot/config/plugins/hardlink-balance/hardlink-balance.cfg"
+
+# Defaults, overridable in CFG_FILE (KEY="value" lines)
+CFG = {
+    "WEBHOOK": "",                                   # optional Alertmanager-style webhook
+    "RUNS_DIR": "/boot/config/plugins/hardlink-balance/runs",
+    "MIN_AGE_MIN": "60",                             # skip folders touched in the last N minutes
+}
 
 # Shares/directories that should never be rebalanced automatically
 DEFAULT_EXCLUDE_DIRS = {
@@ -42,6 +53,10 @@ DEFAULT_EXCLUDE_DIRS = {
     "domains",
     "isos",
 }
+
+# Partial/in-progress download extensions
+PARTIAL_EXTS = (".!qb", ".part", ".partial", ".tmp", ".crdownload", ".!ut", ".aria2")
+TMP_SUFFIX = ".hlb-tmp"
 
 # Minimum safety headroom on destination disks (10 GB)
 MIN_FREE_HEADROOM_KB = 10 * 1024 * 1024
@@ -58,10 +73,22 @@ signal.signal(signal.SIGTERM, _handle_sigterm)
 signal.signal(signal.SIGINT, _handle_sigterm)
 
 
-ALERT_WEBHOOK = "http://127.0.0.1:5678/webhook/alertas"
+def load_cfg():
+    try:
+        with open(CFG_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                CFG[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
 
 
 def notify(summary, description, severity="info"):
+    if not CFG["WEBHOOK"]:
+        return
     payload = {
         "alerts": [{
             "status": "firing",
@@ -69,7 +96,7 @@ def notify(summary, description, severity="info"):
                 "alertname": "EquiLink",
                 "severity": severity,
                 "container": "hardlink_balance",
-                "instance": "Unraid · Odin",
+                "instance": os.uname().nodename,
             },
             "annotations": {
                 "summary": summary,
@@ -81,7 +108,7 @@ def notify(summary, description, severity="info"):
         subprocess.run(
             ["curl", "-fsS", "--max-time", "10",
              "-H", "Content-Type: application/json",
-             "--data-binary", "@-", ALERT_WEBHOOK],
+             "--data-binary", "@-", CFG["WEBHOOK"]],
             input=json.dumps(payload), capture_output=True, text=True, timeout=15,
         )
     except Exception as e:
@@ -111,7 +138,7 @@ def cleanup_empty_parents(path, mount):
     """
     curr = os.path.dirname(os.path.abspath(path))
     mount_abs = os.path.abspath(mount)
-    while curr and curr != mount_abs and curr.startswith(mount_abs):
+    while curr and curr != mount_abs and curr.startswith(mount_abs + os.sep):
         try:
             os.rmdir(curr)
             curr = os.path.dirname(curr)
@@ -150,22 +177,78 @@ def fmt_kb(kb):
     return f"{kb} KB"
 
 
-def _statvfs_path_for(mount):
-    """
-    Pick the path whose statvfs() actually reflects where the content lives.
-    Some array disks (e.g. ZFS members) mount child datasets like
-    /mnt/diskN/datos as SEPARATE filesystems from the disk root.
-    """
-    datos = os.path.join(mount, "datos")
-    if os.path.ismount(datos) or os.path.isdir(datos):
-        try:
-            st = os.statvfs(datos)
-            if (st.f_blocks * st.f_frsize) > 1024 * 1024 * 1024:
-                return datos
-        except OSError:
-            pass
-    return mount
+# ── Activity guards ──────────────────────────────────────────────────────────
 
+_OPEN_W = {"t": 0.0, "set": set()}
+
+
+def open_for_write(max_age=15):
+    """(dev, ino) of every file currently open for writing by any process.
+    Covers shfs (FUSE layer behind /mnt/user), so container writes show up with
+    the real /mnt/diskN inode."""
+    if time.time() - _OPEN_W["t"] < max_age:
+        return _OPEN_W["set"]
+    s = set()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                with open(f"/proc/{pid}/fdinfo/{fd}") as f:
+                    flags = 0
+                    for line in f:
+                        if line.startswith("flags:"):
+                            flags = int(line.split()[1], 8)
+                            break
+                if not flags & 3:          # O_WRONLY / O_RDWR
+                    continue
+                st = os.stat(f"{fd_dir}/{fd}")
+                if stat.S_ISREG(st.st_mode):
+                    s.add((st.st_dev, st.st_ino))
+            except (OSError, ValueError):
+                continue
+    _OPEN_W["t"] = time.time()
+    _OPEN_W["set"] = s
+    return s
+
+
+def array_busy():
+    """Return a reason string if Mover / parity / unBALANCE is running, else ''."""
+    try:
+        with open("/var/local/emhttp/var.ini") as f:
+            for line in f:
+                if line.startswith("mdResyncPos="):
+                    if line.split("=", 1)[1].strip().strip('"') not in ("", "0"):
+                        return "parity check/rebuild in progress"
+    except OSError:
+        pass
+    if os.path.exists("/var/run/mover.pid"):
+        return "Mover is running"
+    r = subprocess.run(["pgrep", "-f", "/usr/local/sbin/mover"], capture_output=True, text=True)
+    if r.stdout.strip():
+        return "Mover is running"
+    # unBALANCE's daemon is always up; it is only busy while one of its rsyncs runs.
+    # Same for any other tool copying between array disks.
+    r = subprocess.run(["pgrep", "-x", "rsync"], capture_output=True, text=True)
+    for pid in r.stdout.split():
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(bytes([0]), b" ").decode(errors="replace")
+            with open(f"/proc/{pid}/status") as f:
+                ppid = next(int(l.split()[1]) for l in f if l.startswith("PPid:"))
+        except (OSError, StopIteration):
+            continue
+        if ppid != os.getpid() and "/mnt/disk" in cmd:
+            return "another rsync is moving data between array disks (unBALANCE?)"
+    return ""
+
+
+# ── Disks ────────────────────────────────────────────────────────────────────
 
 def get_disk_fstype(disk_name):
     ini_path = "/var/local/emhttp/disks.ini"
@@ -188,57 +271,72 @@ def get_disk_fstype(disk_name):
     return "XFS"
 
 
-def discover_disks(exclude_disks=None):
+def disk_space_kb(name, mount, fstype):
+    """(size_kb, free_kb). ZFS: whole pool (statvfs of the root dataset misses
+    child datasets like /mnt/diskN/datos)."""
+    if "ZFS" in fstype:
+        r = subprocess.run(["zfs", "list", "-Hp", "-o", "used,available", name],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            used, avail = (int(x) for x in r.stdout.split()[:2])
+            return (used + avail) // 1024, avail // 1024
+    st = os.statvfs(mount)
+    return (st.f_blocks * st.f_frsize) // 1024, (st.f_bavail * st.f_frsize) // 1024
+
+
+def discover_disks(mnt_root="/mnt", exclude_disks=None):
     """Return dict: name -> {name, mount, fsType, size_kb, used_kb, free_kb, pct}"""
     if exclude_disks is None:
         exclude_disks = set()
     disks = {}
-    for entry in sorted(os.listdir("/mnt")):
+    for entry in sorted(os.listdir(mnt_root)):
         if not DISK_NAME_RE.match(entry):
             continue
         if entry in exclude_disks:
             continue
-        mount = os.path.join("/mnt", entry)
-        if not (os.path.ismount(mount) or os.path.isdir(mount)):
+        mount = os.path.join(mnt_root, entry)
+        if not os.path.ismount(mount):
             continue
+        fstype = get_disk_fstype(entry)
         try:
-            st = os.statvfs(_statvfs_path_for(mount))
-        except OSError:
+            size_kb, free_kb = disk_space_kb(entry, mount, fstype)
+        except (OSError, ValueError):
             continue
-        size_kb = (st.f_blocks * st.f_frsize) // 1024
-        free_kb = (st.f_bavail * st.f_frsize) // 1024
         if size_kb == 0:
             continue
         used_kb = size_kb - free_kb
-        pct = used_kb * 100 // size_kb
         disks[entry] = {
             "name": entry,
             "mount": mount,
-            "fsType": get_disk_fstype(entry),
+            "fsType": fstype,
             "size_kb": size_kb,
             "used_kb": used_kb,
             "free_kb": free_kb,
-            "pct": pct,
+            "pct": used_kb * 100 // size_kb,
         }
     return disks
 
 
-def scan_disk_groups(mount, min_size_kb, exclude_dirs=None):
+# ── Scan & plan ──────────────────────────────────────────────────────────────
+
+def scan_disk_units(mount, min_size_kb, min_age_s, exclude_dirs=None):
     """
-    Walk one disk mount and group regular files by (dev, ino).
-    Returns dict: (dev, ino) -> {"size_kb": int, "paths": [abs paths]}
-    Symlinks and non-regular files are skipped entirely.
+    Walk one disk and build movable folder units.
+    A group = all links of one inode. A unit = all groups whose deepest link
+    lives in the same folder (the library side: season / movie folder).
+    Small files (nfo, srt...) travel with their folder; a unit is only kept if
+    its biggest file reaches min_size_kb.
+    Returns (units, skipped_counter). unit = {key, size_kb, newest, groups[]}.
     """
     if exclude_dirs is None:
         exclude_dirs = DEFAULT_EXCLUDE_DIRS
 
-    groups = defaultdict(lambda: {"size_kb": 0, "paths": []})
+    groups = {}
     for root, dirs, files in os.walk(mount, followlinks=False):
-        # Exclude system and hidden shares at the root of the mount
         if root == mount:
             dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith(".")]
         else:
-            dirs[:] = [d for d in dirs if not d.startswith(".rebalance_stage")]
+            dirs[:] = [d for d in dirs if d not in exclude_dirs]
 
         for name in files:
             path = os.path.join(root, name)
@@ -248,17 +346,61 @@ def scan_disk_groups(mount, min_size_kb, exclude_dirs=None):
                 continue
             if not stat.S_ISREG(st.st_mode):
                 continue
-            size_kb = max(1, st.st_size // 1024)
-            if size_kb < min_size_kb:
+            if name.endswith(TMP_SUFFIX):
+                # Leftover from a crashed run (we hold the lock, nobody else uses this suffix)
+                try:
+                    os.remove(path)
+                    log(f"  removed stale temp file {path}")
+                except OSError:
+                    pass
                 continue
             key = (st.st_dev, st.st_ino)
-            g = groups[key]
-            g["size_kb"] = size_kb
+            g = groups.get(key)
+            if g is None:
+                g = groups[key] = {
+                    "dev": st.st_dev, "ino": st.st_ino, "nlink": st.st_nlink,
+                    "size": st.st_size, "size_kb": max(1, st.st_size // 1024),
+                    "mtime": st.st_mtime, "ctime": st.st_ctime, "paths": [],
+                }
             g["paths"].append(path)
-    return groups
+
+    now = time.time()
+    open_w = open_for_write(max_age=0)
+    units = defaultdict(lambda: {"size_kb": 0, "max_kb": 0, "newest": 0, "groups": [], "bad": ""})
+    for g in groups.values():
+        g["paths"].sort(key=lambda p: (-p.count(os.sep), p))
+        primary = g["paths"][0]
+        u = units[os.path.dirname(primary)]
+        u["groups"].append(g)
+        u["size_kb"] += g["size_kb"]
+        u["max_kb"] = max(u["max_kb"], g["size_kb"])
+        u["newest"] = max(u["newest"], g["mtime"], g["ctime"])
+        if u["bad"]:
+            continue
+        if g["nlink"] != len(g["paths"]):
+            u["bad"] = "links_outside"      # some link lives in an excluded/hidden dir
+        elif any(p.lower().endswith(PARTIAL_EXTS) for p in g["paths"]):
+            u["bad"] = "partial"
+        elif (g["dev"], g["ino"]) in open_w:
+            u["bad"] = "open_write"
+        elif now - max(g["mtime"], g["ctime"]) < min_age_s:
+            u["bad"] = "recent"
+
+    out, skipped = [], defaultdict(int)
+    for key, u in units.items():
+        if u["max_kb"] < min_size_kb:
+            continue
+        if u["bad"]:
+            skipped[u["bad"]] += 1
+            continue
+        u["key"] = key
+        out.append(u)
+    # Oldest folders first: finished, untouched media is the safest to move
+    out.sort(key=lambda u: u["newest"])
+    return out, dict(skipped)
 
 
-def build_plan(disks, tolerance, min_size_kb, limit_kb=None, run_start0=None):
+def build_plan(disks, tolerance, min_size_kb, min_age_s, limit_kb=None, run_start0=None):
     total_size = sum(d["size_kb"] for d in disks.values())
     total_used = sum(d["used_kb"] for d in disks.values())
     target_pct = (total_used * 100 // total_size) if total_size else 0
@@ -274,6 +416,9 @@ def build_plan(disks, tolerance, min_size_kb, limit_kb=None, run_start0=None):
 
     vstate = {name: dict(d) for name, d in disks.items()}
 
+    def pct_with(d, delta_kb):
+        return (d["used_kb"] + delta_kb) * 100 // d["size_kb"]
+
     plan = []
     plan_total_kb = 0
     limit_hit = False
@@ -281,12 +426,12 @@ def build_plan(disks, tolerance, min_size_kb, limit_kb=None, run_start0=None):
     for src_idx, src in enumerate(sources):
         if limit_hit:
             break
-        if vstate[src]["pct"] <= target_pct + tolerance:
+        s = vstate[src]
+        if s["pct"] <= target_pct + tolerance:
             continue
-        need_kb = (vstate[src]["pct"] - target_pct) * vstate[src]["size_kb"] // 100
-        log(f"Scanning {src} ({vstate[src]['pct']}%, need to shed ~{fmt_kb(need_kb)})...")
+        need_kb = (s["pct"] - target_pct) * s["size_kb"] // 100
+        log(f"Scanning {src} ({s['pct']}%, need to shed ~{fmt_kb(need_kb)})...")
 
-        # Report scanning progress for WebUI
         if run_start0:
             write_json_atomic(STATUS_FILE, {
                 "state": "planning",
@@ -301,52 +446,53 @@ def build_plan(disks, tolerance, min_size_kb, limit_kb=None, run_start0=None):
                 "plan_count": len(plan),
             })
 
-        groups = scan_disk_groups(vstate[src]["mount"], min_size_kb)
-        log(f"  {src}: {len(groups)} hardlink-groups found "
-            f"({sum(1 for g in groups.values() if len(g['paths']) > 1)} are multi-linked)")
+        units, skipped = scan_disk_units(s["mount"], min_size_kb, min_age_s)
+        log(f"  {src}: {len(units)} movable folders"
+            + (f"; skipped {skipped}" if skipped else ""))
 
-        for key, g in groups.items():
-            if vstate[src]["pct"] <= target_pct + tolerance:
+        for u in units:
+            if s["pct"] <= target_pct + tolerance:
                 break
             if limit_kb is not None and plan_total_kb >= limit_kb:
                 limit_hit = True
                 break
-            size_kb = g["size_kb"]
+            size_kb = u["size_kb"]
+            # Don't overshoot the source below the band
+            if pct_with(s, -size_kb) < target_pct - tolerance:
+                continue
 
+            rels = [rel_to_mount(p, s["mount"]) for g in u["groups"] for p in g["paths"]]
             best = None
-            best_pct = None
             for dname, d in vstate.items():
                 if dname == src:
                     continue
-                if d["pct"] >= target_pct + tolerance:
-                    continue
-                # Ensure destination has space PLUS safety headroom
+                if any(os.path.lexists(os.path.join(d["mount"], r)) for r in rels):
+                    continue        # same path already on that disk: would collide
                 if d["free_kb"] - size_kb < MIN_FREE_HEADROOM_KB:
                     continue
-                new_pct = (d["used_kb"] + size_kb) * 100 // d["size_kb"]
-                if new_pct > target_pct + tolerance:
+                if pct_with(d, size_kb) > target_pct + tolerance:
                     continue
-                if best is None or d["pct"] < best_pct:
+                if best is None or d["pct"] < vstate[best]["pct"]:
                     best = dname
-                    best_pct = d["pct"]
-
             if best is None:
                 continue
 
-            plan.append({
-                "src_disk": src,
-                "dst_disk": best,
-                "size_kb": size_kb,
-                "paths": g["paths"],
-            })
+            for g in u["groups"]:
+                plan.append({
+                    "src_disk": src,
+                    "dst_disk": best,
+                    "size_kb": g["size_kb"],
+                    "paths": g["paths"],
+                    "dev": g["dev"], "ino": g["ino"],
+                    "size": g["size"], "mtime": g["mtime"],
+                })
             plan_total_kb += size_kb
 
-            vstate[src]["used_kb"] -= size_kb
-            vstate[src]["free_kb"] += size_kb
-            vstate[src]["pct"] = vstate[src]["used_kb"] * 100 // vstate[src]["size_kb"]
-            vstate[best]["used_kb"] += size_kb
-            vstate[best]["free_kb"] -= size_kb
-            vstate[best]["pct"] = vstate[best]["used_kb"] * 100 // vstate[best]["size_kb"]
+            for name, delta in ((src, -size_kb), (best, size_kb)):
+                d = vstate[name]
+                d["used_kb"] += delta
+                d["free_kb"] -= delta
+                d["pct"] = d["used_kb"] * 100 // d["size_kb"]
 
     return plan, disks, target_pct
 
@@ -402,130 +548,141 @@ def rel_to_mount(path, mount):
     return os.path.relpath(path, mount)
 
 
+# ── Execute ──────────────────────────────────────────────────────────────────
+
+def _rm(paths):
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _source_unchanged(group, fresh=True):
+    """Every source link still is the same inode, with the same link count,
+    size and mtime, and nobody has it open for writing."""
+    for p in group["paths"]:
+        try:
+            st = os.lstat(p)
+        except OSError as e:
+            return f"source vanished {p}: {e}"
+        if (st.st_dev, st.st_ino) != (group["dev"], group["ino"]):
+            return f"source replaced {p}"
+        if st.st_nlink != len(group["paths"]):
+            return f"link count changed ({st.st_nlink} != {len(group['paths'])}) {p}"
+        if st.st_size != group["size"] or st.st_mtime != group["mtime"]:
+            return f"source modified {p}"
+    if (group["dev"], group["ino"]) in open_for_write(max_age=0 if fresh else 15):
+        return f"source open for writing {group['paths'][0]}"
+    return ""
+
+
 def execute_group(group, disks):
     """
-    Executes a move for an entire hardlink group:
-      1. Verifies no collision exists at destination.
-      2. Records source stat (size, mtime) to detect concurrent modifications.
-      3. Rsyncs the primary file.
-      4. Verifies size and checks that source wasn't modified mid-copy.
-      5. Recreates hardlinks for all other group members on destination disk.
-      6. Verifies all links and removes originals.
-      7. Prunes empty parent directories on source disk.
+    Returns (status, rel_primary). status: "ok", "skipped" (nothing changed on
+    disk) or "partial" (copy published but some source link could not be removed).
+      1. Collision guard on every destination path.
+      2. Re-check source (inode, nlink, size, mtime, not open for write).
+      3. rsync to a hidden temp file (interruptible), verify size.
+      4. Re-check source again, publish temp with a no-clobber link, recreate links.
+      5. Remove originals, prune empty source folders.
     """
     src_mount = disks[group["src_disk"]]["mount"]
     dst_mount = disks[group["dst_disk"]]["mount"]
     paths = group["paths"]
     primary = paths[0]
-
     rel_primary = rel_to_mount(primary, src_mount)
-    dst_primary = os.path.join(dst_mount, rel_primary)
+    dst_all = [os.path.join(dst_mount, rel_to_mount(p, src_mount)) for p in paths]
+    dst_primary = dst_all[0]
 
-    # Collision guard
-    if os.path.exists(dst_primary):
-        log(f"  SKIPPED collision: destination file already exists: {dst_primary}")
-        return False, None
+    for dp in dst_all:
+        if os.path.lexists(dp):
+            log(f"  SKIPPED collision: destination already exists: {dp}")
+            return "skipped", rel_primary
 
-    for p in paths[1:]:
-        rel = rel_to_mount(p, src_mount)
-        dp = os.path.join(dst_mount, rel)
-        if os.path.exists(dp):
-            log(f"  SKIPPED collision: destination link already exists: {dp}")
-            return False, None
+    why = _source_unchanged(group, fresh=False)
+    if why:
+        log(f"  SKIPPED {why}")
+        return "skipped", rel_primary
 
     makedirs_nobody(os.path.dirname(dst_primary))
+    tmp = os.path.join(os.path.dirname(dst_primary), "." + os.path.basename(dst_primary) + TMP_SUFFIX)
+
+    proc = subprocess.Popen(["rsync", "-aX", primary, tmp],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    while proc.poll() is None:
+        if _STOP:
+            proc.terminate()
+            proc.wait()
+            _rm([tmp])
+            log(f"  ABORTED copy of {rel_primary} (stop requested, source untouched)")
+            return "skipped", rel_primary
+        time.sleep(0.2)
+    if proc.returncode != 0:
+        _rm([tmp])
+        log(f"  ERROR rsync {primary}: {proc.stderr.read().strip()}")
+        return "skipped", rel_primary
 
     try:
-        orig_stat = os.stat(primary)
-        orig_size = orig_stat.st_size
-        orig_mtime = orig_stat.st_mtime
+        copied = os.path.getsize(tmp)
     except OSError as e:
-        log(f"  ERROR stat {primary}: {e}")
-        return False, None
+        log(f"  ERROR verify {tmp}: {e}")
+        return "skipped", rel_primary
+    if copied != group["size"]:
+        _rm([tmp])
+        log(f"  ERROR size mismatch {tmp}: {copied} != {group['size']}")
+        return "skipped", rel_primary
 
-    r = subprocess.run(
-        ["rsync", "-aX", primary, dst_primary],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        log(f"  ERROR rsync {primary} -> {dst_primary}: {r.stderr.strip()}")
-        return False, None
+    why = _source_unchanged(group)
+    if why:
+        _rm([tmp])
+        log(f"  SKIPPED {why} (during copy)")
+        return "skipped", rel_primary
 
+    made = []
     try:
-        copied_size = os.path.getsize(dst_primary)
+        for dp in dst_all:
+            makedirs_nobody(os.path.dirname(dp))
+            os.link(tmp, dp)          # fails if dp appeared meanwhile: never overwrites
+            made.append(dp)
     except OSError as e:
-        log(f"  ERROR verify {dst_primary}: {e}")
-        return False, None
+        _rm(made + [tmp])
+        log(f"  ERROR linking {e.filename}: {e.strerror}")
+        return "skipped", rel_primary
+    _rm([tmp])
 
-    if copied_size != orig_size:
-        log(f"  ERROR size mismatch {dst_primary}: {copied_size} != {orig_size}")
-        try:
-            os.remove(dst_primary)
-        except OSError:
-            pass
-        return False, None
-
-    # Concurrent modification check
-    try:
-        check_stat = os.stat(primary)
-        if check_stat.st_size != orig_size or check_stat.st_mtime != orig_mtime:
-            log(f"  SKIPPED concurrent modification: file was modified mid-transfer: {primary}")
-            try:
-                os.remove(dst_primary)
-            except OSError:
-                pass
-            return False, None
-    except OSError:
-        pass
-
-    dst_paths = [dst_primary]
-    ok = True
-    for p in paths[1:]:
-        rel = rel_to_mount(p, src_mount)
-        dst_p = os.path.join(dst_mount, rel)
-        makedirs_nobody(os.path.dirname(dst_p))
-        try:
-            if os.path.exists(dst_p):
-                os.remove(dst_p)
-            os.link(dst_primary, dst_p)
-            dst_paths.append(dst_p)
-        except OSError as e:
-            log(f"  ERROR hardlink {dst_p}: {e}")
-            ok = False
-            break
-
-    if not ok:
-        for dp in dst_paths:
-            try:
-                os.remove(dp)
-            except OSError:
-                pass
-        return False, None
-
-    # Everything verified — remove originals and prune empty directories
+    failed_rm = []
     for p in paths:
         try:
             os.remove(p)
             cleanup_empty_parents(p, src_mount)
         except OSError as e:
-            log(f"  WARNING could not remove original {p}: {e}")
+            failed_rm.append(p)
+            log(f"  ERROR could not remove original {p}: {e} — file now exists on both disks")
 
     tag = f"[{len(paths)} links]" if len(paths) > 1 else ""
-    log(f"  MOVED {tag} {rel_primary} ({fmt_kb(orig_size // 1024)}) "
+    log(f"  MOVED {tag} {rel_primary} ({fmt_kb(group['size'] // 1024)}) "
         f"{group['src_disk']} -> {group['dst_disk']}")
-    return True, rel_primary
+    return ("partial" if failed_rm else "ok"), rel_primary
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tolerance", type=int, default=2, help="target +/- percent (default 2)")
-    ap.add_argument("--min-size-kb", type=int, default=0, help="skip files smaller than this")
+    ap.add_argument("--min-size-kb", type=int, default=0, help="skip folders whose biggest file is smaller")
+    ap.add_argument("--min-age-min", type=int, default=None, help="skip folders touched in the last N minutes")
     ap.add_argument("--limit-gb", type=float, default=None, help="cap total plan size (for a safe test run)")
     ap.add_argument("--exclude-disks", type=str, default="", help="comma-separated disk names to exclude (e.g. disk8)")
+    ap.add_argument("--mnt-root", type=str, default="/mnt", help=argparse.SUPPRESS)  # tests
+    ap.add_argument("--headroom-mb", type=int, default=None, help=argparse.SUPPRESS)  # tests
     ap.add_argument("--execute", action="store_true", help="actually move data (default is dry-run)")
     ap.add_argument("--dry-run", action="store_true", help="dry-run only (default)")
     ap.add_argument("--stop", action="store_true", help="stop currently running instance")
     args = ap.parse_args()
+    load_cfg()
+    if args.headroom_mb is not None:
+        global MIN_FREE_HEADROOM_KB
+        MIN_FREE_HEADROOM_KB = args.headroom_mb * 1024
 
     if args.stop:
         if not os.path.exists(LOCK_FILE):
@@ -543,6 +700,8 @@ def main():
 
     limit_kb = int(args.limit_gb * 1024 * 1024) if args.limit_gb else None
     exclude_disks = {d.strip() for d in args.exclude_disks.split(",") if d.strip()}
+    min_age_min = args.min_age_min if args.min_age_min is not None else int(CFG["MIN_AGE_MIN"])
+    min_age_s = max(0, min_age_min) * 60
 
     if os.path.exists(LOCK_FILE):
         try:
@@ -558,13 +717,23 @@ def main():
 
     try:
         run_start0 = time.time()
-        disks = discover_disks(exclude_disks)
+        busy = array_busy()
+        if busy and args.execute:
+            log(f"ABORT: {busy}. Try again when it finishes.")
+            write_json_atomic(STATUS_FILE, {"state": "error", "msg": busy, "updated_at": time.time()})
+            return
+        if busy:
+            log(f"WARNING: {busy} — the plan may change before you execute it.")
+
+        disks = discover_disks(args.mnt_root, exclude_disks)
         log(f"Found {len(disks)} active data disks: {', '.join(sorted(disks))}")
         for name in sorted(disks):
             d = disks[name]
             log(f"  {name} ({d['fsType']}): {d['pct']}% used ({fmt_kb(d['used_kb'])} / {fmt_kb(d['size_kb'])})")
+        log(f"Skipping folders touched in the last {min_age_min} min, open for writing or partial.")
 
-        plan, disks, target_pct = build_plan(disks, args.tolerance, args.min_size_kb, limit_kb, run_start0)
+        plan, disks, target_pct = build_plan(disks, args.tolerance, args.min_size_kb, min_age_s,
+                                             limit_kb, run_start0)
         if not plan:
             write_json_atomic(STATUS_FILE, {
                 "state": "completed",
@@ -579,7 +748,7 @@ def main():
                     "bytes_total_kb": 0, "bytes_done_kb": 0, "pct_done": 100,
                     "rate_kbs": 0, "eta_sec": 0, "multi_linked_groups": 0, "multi_linked_kb": 0,
                 },
-                "note": "all disks within tolerance",
+                "note": "nothing movable within tolerance",
                 "updated_at": time.time(),
             })
             return
@@ -602,7 +771,7 @@ def main():
             })
         write_json_atomic(PLAN_FILE, plan_export)
 
-        planned_payload = {
+        write_json_atomic(STATUS_FILE, {
             "state": "planned",
             "started_at": run_start0,
             "updated_at": time.time(),
@@ -624,8 +793,7 @@ def main():
                 "multi_linked_groups": len(multi0),
                 "multi_linked_kb": multi_kb,
             },
-        }
-        write_json_atomic(STATUS_FILE, planned_payload)
+        })
 
         if not args.execute:
             log("DRY RUN — no data was moved. Re-run with --execute to apply this plan.")
@@ -634,21 +802,28 @@ def main():
         log("EXECUTING plan...")
         done = 0
         failed = 0
+        partial = 0
         freed_kb = 0
         results = []
         run_start = time.time()
         stopped_early = False
+        stop_reason = ""
 
         for i, group in enumerate(plan):
-            if _STOP:
-                log("Received stop signal — halting before next group (nothing mid-flight touched).")
+            if not _STOP and i % 25 == 0:
+                stop_reason = array_busy()
+            if _STOP or stop_reason:
+                log(f"Halting: {stop_reason or 'stop signal received'} (in-flight copy cleaned, sources untouched).")
                 stopped_early = True
                 break
 
             t0 = time.time()
-            ok, rel_primary = execute_group(group, disks)
+            status, rel_primary = execute_group(group, disks)
+            if _STOP and status == "skipped":
+                stopped_early = True
             elapsed = max(0.001, time.time() - t0)
             rate_mbs = (group["size_kb"] / 1024) / elapsed
+            ok = status == "ok"
 
             results.append({
                 "index": i,
@@ -658,6 +833,7 @@ def main():
                 "n_paths": len(group["paths"]),
                 "rel_path": rel_primary,
                 "ok": ok,
+                "status": status,
                 "elapsed_s": round(elapsed, 2),
                 "rate_mbs": round(rate_mbs, 1),
             })
@@ -667,11 +843,12 @@ def main():
                 freed_kb += group["size_kb"]
             else:
                 failed += 1
+                if status == "partial":
+                    partial += 1
 
-            done_kb = sum(r["size_kb"] for r in results if r["ok"])
             elapsed_total = time.time() - run_start
-            overall_rate_mbs = (done_kb / 1024) / elapsed_total if elapsed_total > 0 else 0
-            remaining_kb = total_kb - done_kb
+            overall_rate_mbs = (freed_kb / 1024) / elapsed_total if elapsed_total > 0 else 0
+            remaining_kb = total_kb - freed_kb
             eta_sec = int(remaining_kb / 1024 / overall_rate_mbs) if overall_rate_mbs > 0 else 0
 
             write_json_atomic(STATUS_FILE, {
@@ -691,8 +868,8 @@ def main():
                     "files_done": done,
                     "files_skipped": failed,
                     "bytes_total_kb": total_kb,
-                    "bytes_done_kb": done_kb,
-                    "pct_done": round(done_kb * 100 / total_kb, 1) if total_kb else 100,
+                    "bytes_done_kb": freed_kb,
+                    "pct_done": round(freed_kb * 100 / total_kb, 1) if total_kb else 100,
                     "rate_kbs": int(overall_rate_mbs * 1024),
                     "eta_sec": eta_sec,
                     "multi_linked_groups": len(multi0),
@@ -710,16 +887,17 @@ def main():
 
             if (i + 1) % 50 == 0:
                 log(f"  progress: {i+1}/{len(plan)} groups processed "
-                    f"({fmt_kb(done_kb)} / {fmt_kb(total_kb)}, {overall_rate_mbs:.0f} MB/s avg)")
+                    f"({fmt_kb(freed_kb)} / {fmt_kb(total_kb)}, {overall_rate_mbs:.0f} MB/s avg)")
 
         elapsed_total = time.time() - run_start
         state = "stopped" if stopped_early else "completed"
 
         log("=" * 70)
         log(f"{'STOPPED' if stopped_early else 'DONE'}. {done} groups moved ({fmt_kb(freed_kb)}), "
-            f"{failed} failed/skipped, {elapsed_total/60:.1f} min elapsed.")
+            f"{failed} failed/skipped ({partial} left on both disks), {elapsed_total/60:.1f} min elapsed.")
         log("=" * 70)
 
+        disks_after = discover_disks(args.mnt_root, exclude_disks)
         write_json_atomic(STATUS_FILE, {
             "state": state,
             "started_at": run_start,
@@ -728,7 +906,7 @@ def main():
             "tolerance": args.tolerance,
             "target_pct": target_pct,
             "elapsed_sec": int(elapsed_total),
-            "disks": _build_disks_list(discover_disks(exclude_disks), target_pct, args.tolerance),
+            "disks": _build_disks_list(disks_after, target_pct, args.tolerance),
             "plan_count": len(plan),
             "plan": plan_export[:100],
             "stats": {
@@ -738,22 +916,23 @@ def main():
                 "bytes_total_kb": total_kb,
                 "bytes_done_kb": freed_kb,
                 "pct_done": round(freed_kb * 100 / total_kb, 1) if total_kb else 100,
-                "rate_kbs": int(((freed_kb / elapsed_total)) if elapsed_total > 0 else 0),
+                "rate_kbs": int(freed_kb / elapsed_total) if elapsed_total > 0 else 0,
                 "eta_sec": 0,
                 "multi_linked_groups": len(multi0),
                 "multi_linked_kb": multi_kb,
             },
         })
 
+        runs_dir = CFG["RUNS_DIR"]
         try:
-            os.makedirs(RUNS_DIR, exist_ok=True)
+            os.makedirs(runs_dir, exist_ok=True)
             run_id = time.strftime("%Y%m%d_%H%M%S", time.localtime(run_start))
-            multi = [g for g in plan if len(g["paths"]) > 1]
-            write_json_atomic(os.path.join(RUNS_DIR, f"run_{run_id}.json"), {
+            write_json_atomic(os.path.join(runs_dir, f"run_{run_id}.json"), {
                 "run_id": run_id,
                 "state": state,
                 "tolerance": args.tolerance,
                 "min_size_kb": args.min_size_kb,
+                "min_age_min": min_age_min,
                 "limit_gb": args.limit_gb,
                 "target_pct": target_pct,
                 "started_at": run_start,
@@ -761,40 +940,42 @@ def main():
                 "elapsed_s": round(elapsed_total, 1),
                 "disks_before": disks,
                 "plan_groups": len(plan),
-                "plan_multi_linked_groups": len(multi),
-                "plan_multi_linked_kb": sum(g["size_kb"] for g in multi),
+                "plan_multi_linked_groups": len(multi0),
+                "plan_multi_linked_kb": multi_kb,
                 "plan_total_kb": total_kb,
                 "groups_ok": done,
                 "groups_failed": failed,
+                "groups_partial": partial,
                 "bytes_moved_kb": freed_kb,
                 "results": results,
             })
-            log(f"Run report saved: {RUNS_DIR}/run_{run_id}.json")
+            log(f"Run report saved: {runs_dir}/run_{run_id}.json")
         except OSError as e:
             log(f"WARNING could not save run report: {e}")
 
-        if args.execute:
-            disks_after = discover_disks(exclude_disks)
-            after_lines = "\n".join(
-                f"{n}: {disks_after[n]['pct']}%" for n in sorted(disks_after)
+        after_lines = "\n".join(f"{n}: {disks_after[n]['pct']}%" for n in sorted(disks_after))
+        if partial:
+            notify(f"EquiLink: {partial} archivos quedaron en DOS discos",
+                   f"No se pudo borrar el original tras copiarlo. Revisar {LOG_FILE} "
+                   f"(líneas 'could not remove original').\nDiscos:\n{after_lines}",
+                   severity="critical")
+        elif failed > 0 or stopped_early:
+            notify(
+                f"EquiLink: {'parado' if stopped_early else 'terminado con saltos'} "
+                f"({done} ok, {failed} saltados)",
+                f"{fmt_kb(freed_kb)} movidos en {elapsed_total/60:.1f} min."
+                + (f" Motivo: {stop_reason}." if stop_reason else "")
+                + f"\nDiscos tras la pasada:\n{after_lines}\nDetalle en {LOG_FILE}.",
+                severity="warning",
             )
-            if failed > 0 or stopped_early:
-                notify(
-                    f"EquiLink: {'parado' if stopped_early else 'terminado con fallos'} "
-                    f"({done} ok, {failed} fallidos)",
-                    f"{fmt_kb(freed_kb)} movidos en {elapsed_total/60:.1f} min.\n"
-                    f"Discos tras la pasada:\n{after_lines}\n"
-                    f"Revisar {LOG_FILE} para el detalle de los fallos.",
-                    severity="warning",
-                )
-            else:
-                avg_mbs = (freed_kb / 1024) / elapsed_total if elapsed_total > 0 else 0
-                notify(
-                    f"EquiLink: terminado OK ({done} grupos, {fmt_kb(freed_kb)})",
-                    f"{elapsed_total/60:.1f} min, {avg_mbs:.0f} MB/s promedio.\n"
-                    f"Discos tras la pasada:\n{after_lines}",
-                    severity="info",
-                )
+        else:
+            avg_mbs = (freed_kb / 1024) / elapsed_total if elapsed_total > 0 else 0
+            notify(
+                f"EquiLink: terminado OK ({done} grupos, {fmt_kb(freed_kb)})",
+                f"{elapsed_total/60:.1f} min, {avg_mbs:.0f} MB/s promedio.\n"
+                f"Discos tras la pasada:\n{after_lines}",
+                severity="info",
+            )
     finally:
         try:
             os.remove(LOCK_FILE)

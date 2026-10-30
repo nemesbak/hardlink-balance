@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name       "hardlink-balance">
   <!ENTITY author     "nemes">
-  <!ENTITY version    "2026.10.30">
+  <!ENTITY version    "2026.10.30b">
   <!ENTITY github     "nemesbak/hardlink-balance">
   <!ENTITY pluginURL  "https://raw.githubusercontent.com/&github;/main/hardlink-balance.plg">
   <!ENTITY pluginDir  "/usr/local/emhttp/plugins/&name;">
@@ -20,10 +20,20 @@
 >
 
 <CHANGES>
+##2026.10.30b
+- Safety: groups are moved only if every hardlink was found (st_nlink check); no more half-moved groups.
+- Safety: copy to a hidden temp file, publish with a no-clobber link; crashes leave no half files.
+- Safety: skip folders touched recently (MIN_AGE_MIN, default 60), open for writing, or partial downloads (.!qB, .part).
+- Safety: source re-verified (inode, link count, size, mtime, writers) right before deleting.
+- Safety: refuses to run during Mover, parity check or unBALANCE; stop now aborts the copy in flight.
+- Moves whole folders (season / movie), oldest first, instead of scattering single files.
+- ZFS disks report whole-pool capacity; failed source deletions are counted and alerted.
+- Optional settings in /boot/config/plugins/hardlink-balance/hardlink-balance.cfg (WEBHOOK, RUNS_DIR, MIN_AGE_MIN).
+
 ##2026.10.30
 - Initial official release of Hardlink Balance for Unraid.
 - Hardlink-safe balancer engine grouping files by physical inode (st_dev, st_ino).
-- Completely prevents duplicate space usage between qBittorrent downloads and Radarr/Sonarr/Jellyfin libraries.
+- Prevents duplicate space usage between qBittorrent downloads and Radarr/Sonarr/Jellyfin libraries.
 - Native interactive WebGUI dashboard integrated under Tools (Herramientas).
 - Live disk utilization bars, target line, and source/destination/balanced indicators.
 - Real-time progress tracking: transfer speed (MB/s), elapsed time, ETA.
@@ -71,6 +81,16 @@ chmod 644 &pluginDir;/scripts/status.php
 chmod 644 &pluginDir;/HardlinkBalance.page
 chmod 644 &pluginDir;/images/*
 
+# Default settings (kept on upgrade)
+if [[ ! -f &bootDir;/hardlink-balance.cfg ]]; then
+  echo '# Alertmanager-style webhook for end-of-run alerts (empty = off)' > &bootDir;/hardlink-balance.cfg
+  echo 'WEBHOOK=""' >> &bootDir;/hardlink-balance.cfg
+  echo '# Where run reports are stored' >> &bootDir;/hardlink-balance.cfg
+  echo 'RUNS_DIR="&bootDir;/runs"' >> &bootDir;/hardlink-balance.cfg
+  echo '# Skip folders modified or hardlinked in the last N minutes' >> &bootDir;/hardlink-balance.cfg
+  echo 'MIN_AGE_MIN="60"' >> &bootDir;/hardlink-balance.cfg
+fi
+
 # Backup to flash for offline boots
 mkdir -p &bootDir;/scripts &bootDir;/images
 cp -a &pluginDir;/HardlinkBalance.page &bootDir;/
@@ -91,7 +111,8 @@ echo ""
 <INLINE>
 # Stop any running process
 if [[ -f /tmp/hardlink_balance.lock ]]; then
-    kill "$(cat /tmp/hardlink_balance.lock)" 2>/dev/null
+    pid="$(cat /tmp/hardlink_balance.lock)"
+    kill -TERM -- "-$(ps -o pgid= "$pid" | tr -d ' ')" 2>/dev/null || kill "$pid" 2>/dev/null
     rm -f /tmp/hardlink_balance.lock
 fi
 

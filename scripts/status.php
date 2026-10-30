@@ -29,13 +29,16 @@ function is_running(): bool {
     return pid_alive($pid);
 }
 
-function _check_disk_path(string $mount): string {
-    $datos = $mount . '/datos';
-    if (is_dir($datos)) {
-        $st = @disk_total_space($datos);
-        if ($st && $st > 1073741824) return $datos;
+/** [total, free] in bytes. ZFS: whole pool, so child datasets (/mnt/diskN/datos) count. */
+function disk_space(string $name, string $mount, string $fsType): array {
+    if (stripos($fsType, 'zfs') !== false) {
+        $out = trim((string)@shell_exec('zfs list -Hp -o used,available ' . escapeshellarg($name) . ' 2>/dev/null'));
+        $p = preg_split('/\s+/', $out);
+        if (count($p) >= 2 && is_numeric($p[0]) && is_numeric($p[1])) {
+            return [(float)$p[0] + (float)$p[1], (float)$p[1]];
+        }
     }
-    return $mount;
+    return [@disk_total_space($mount), @disk_free_space($mount)];
 }
 
 function get_disk_meta(): array {
@@ -58,7 +61,7 @@ function get_disk_meta(): array {
 }
 
 function live_disk_stats(int $tolerance): array {
-    $mounts = glob('/mnt/disk[0-9]*') ?: [];
+    $mounts = array_filter(glob('/mnt/disk[0-9]*') ?: [], fn($m) => preg_match('#^/mnt/disk\d+$#', $m));
     natsort($mounts);
 
     $disk_meta = get_disk_meta();
@@ -69,9 +72,8 @@ function live_disk_stats(int $tolerance): array {
     foreach ($mounts as $mount) {
         if (!is_dir($mount)) continue;
         $name = basename($mount);
-        $chk_path = _check_disk_path($mount);
-        $total  = @disk_total_space($chk_path);
-        $free   = @disk_free_space($chk_path);
+        $meta = $disk_meta[$name] ?? ['fsType' => 'XFS', 'temp' => '', 'device' => ''];
+        [$total, $free] = disk_space($name, $mount, $meta['fsType']);
         if ($total === false || $total == 0) continue;
 
         $used        = $total - $free;
@@ -79,7 +81,6 @@ function live_disk_stats(int $tolerance): array {
         $total_used += $used;
 
         $pct = ($total > 0) ? (int)round($used * 100 / $total) : 0;
-        $meta = $disk_meta[$name] ?? ['fsType' => 'XFS', 'temp' => '', 'device' => ''];
 
         $raw[] = [
             'name'    => $name,
@@ -195,7 +196,7 @@ function idle_payload(int $tolerance, ?array $existing = null): array {
 }
 
 function launch_script(string $cmd): bool {
-    $shell_cmd = 'nohup ' . $cmd . ' </dev/null >/dev/null 2>&1 &';
+    $shell_cmd = 'setsid nohup ' . $cmd . ' </dev/null >/dev/null 2>&1 &';
     if (function_exists('exec')) {
         exec($shell_cmd);
         return true;
@@ -218,13 +219,13 @@ $var = @parse_ini_file('/var/local/emhttp/var.ini') ?: [];
 $csrf_expected = $var['csrf_token'] ?? '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (!empty($csrf_expected) && isset($_POST['csrf_token']) && $_POST['csrf_token'] !== $csrf_expected) {
+    if (!empty($csrf_expected) && ($_POST['csrf_token'] ?? '') !== $csrf_expected) {
         json_out(['success' => false, 'msg' => 'Invalid CSRF token']);
         exit;
     }
 
     $action      = $_POST['action']       ?? '';
-    $tolerance   = max(1, min(20, (int)($_POST['tolerance'] ?? 2)));
+    $tolerance   = max(1, min(10, (int)($_POST['tolerance'] ?? 2)));
     $dry_run     = !empty($_POST['dry_run']);
     $min_file_kb = max(0, (int)($_POST['min_file_kb'] ?? 102400));
     $limit_gb    = max(0, (float)($_POST['limit_gb'] ?? 0));
@@ -289,7 +290,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     exit;
 }
 
-$tolerance = max(1, min(20, (int)($_GET['tolerance'] ?? 2)));
+$tolerance = max(1, min(10, (int)($_GET['tolerance'] ?? 2)));
 
 if (is_running()) {
     if (file_exists(STATUS_FILE)) {

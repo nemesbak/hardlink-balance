@@ -64,7 +64,7 @@ EquiLink (Inode-Aware Engine):
 | **🚫 Collision Prevention Guard** | Proactively checks if destination file paths already exist before transferring. Never overwrites existing files. |
 | **⚡ Concurrent Write Guard** | Compares `st_size` and `st_mtime` before and after transfer. If a file is modified mid-copy (e.g. active torrent download), it skips it and safely rolls back. |
 | **🧹 Empty Directory Pruning** | Automatically prunes empty parent directory hierarchies on the source disk up to the share root after moving files. |
-| **💾 ZFS & XFS Child Mount Support** | Accurately calculates disk capacity and datasets across standard XFS drives and ZFS pools/datasets (e.g. `/mnt/diskN/datos`). |
+| **💾 ZFS & XFS Child Mount Support** | ZFS disks are measured at pool level, so child datasets (e.g. `/mnt/diskN/datos`) are counted. |
 | **👤 Nobody:Users Ownership** | Automatically enforces `nobody:users` (99:100) and `0775` permissions on all newly created folders and files. |
 | **🔍 Live Interactive Plan Search** | Real-time search bar and filter chips (*All*, *Hardlinks Only*, *Single Files*) to inspect the transfer plan instantly in the WebGUI. |
 | **⏹️ Graceful Stop** | Halts execution cleanly after the currently active file group completes, ensuring zero partial or broken files. |
@@ -143,10 +143,33 @@ python3 /usr/local/emhttp/plugins/hardlink-balance/scripts/hardlink_balance.py -
 EquiLink uses a two-phase commit: only after the copy is completely finished and all hardlinks are verified on the destination drive does it remove the originals from the source drive. If stopped, the in-flight file finishes cleanly and execution halts. No partial or corrupt files are ever created.
 
 #### Is ZFS supported?
-**Yes.** EquiLink natively detects ZFS datasets (such as `/mnt/diskN/datos`) and measures statvfs accurately on child datasets.
+**Yes.** On ZFS disks EquiLink reads the pool's used/available (`zfs list`), so child datasets such as `/mnt/diskN/datos` are included.
 
 ---
 
 ## 📄 License
 
 MIT License. Designed and maintained for the Unraid community.
+
+## Active-download safety
+
+Torrent ↔ library hardlinks are moved together, and a folder is **skipped** when any of these is true:
+
+- a file in it was modified or got a new hardlink in the last `MIN_AGE_MIN` minutes (default 60);
+- a file is open for writing by any process (qBittorrent, *arr, HandBrake… detected through `/proc`, including shfs);
+- a file is a partial download (`.!qB`, `.part`, …);
+- a hardlink of a file lives somewhere the scan can't see (link count mismatch).
+
+Right before deleting the source, every link is re-checked (same inode, link count, size, mtime, no writers).
+Runs are refused while Mover, a parity check or another rsync between array disks (unBALANCE) is active.
+Seeding keeps working: qBittorrent reads the file through `/mnt/user`, which follows it to the new disk.
+
+## Settings
+
+`/boot/config/plugins/hardlink-balance/hardlink-balance.cfg`:
+
+| Key | Default | |
+|---|---|---|
+| `WEBHOOK` | empty | Alertmanager-style webhook for end-of-run alerts |
+| `RUNS_DIR` | `/boot/config/plugins/hardlink-balance/runs` | JSON report per executed run |
+| `MIN_AGE_MIN` | `60` | Skip folders touched in the last N minutes |
