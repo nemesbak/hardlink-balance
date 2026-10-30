@@ -1,6 +1,6 @@
 <?php
 /**
- * Hardlink Balance — AJAX status / control endpoint
+ * Hardlink Balance / EquiLink — AJAX status & control endpoint
  * Accessible at: /plugins/hardlink-balance/scripts/status.php
  */
 
@@ -38,16 +38,37 @@ function _check_disk_path(string $mount): string {
     return $mount;
 }
 
+function get_disk_meta(): array {
+    $meta = [];
+    $ini = @parse_ini_file('/var/local/emhttp/disks.ini', true);
+    if ($ini) {
+        foreach ($ini as $sec => $d) {
+            $name = trim($sec, '[]"');
+            if (strpos($name, 'disk') === 0) {
+                $meta[$name] = [
+                    'fsType'    => strtoupper($d['fsType'] ?? 'XFS'),
+                    'device'    => $d['device'] ?? '',
+                    'temp'      => ($d['temp'] ?? '*') !== '*' ? $d['temp'] . '°C' : '',
+                    'rotational'=> ($d['rotational'] ?? '1') === '1',
+                ];
+            }
+        }
+    }
+    return $meta;
+}
+
 function live_disk_stats(int $tolerance): array {
     $mounts = glob('/mnt/disk[0-9]*') ?: [];
     natsort($mounts);
 
+    $disk_meta = get_disk_meta();
     $total_size = 0;
     $total_used = 0;
     $raw = [];
 
     foreach ($mounts as $mount) {
         if (!is_dir($mount)) continue;
+        $name = basename($mount);
         $chk_path = _check_disk_path($mount);
         $total  = @disk_total_space($chk_path);
         $free   = @disk_free_space($chk_path);
@@ -57,36 +78,48 @@ function live_disk_stats(int $tolerance): array {
         $total_size += $total;
         $total_used += $used;
 
+        $pct = ($total > 0) ? (int)round($used * 100 / $total) : 0;
+        $meta = $disk_meta[$name] ?? ['fsType' => 'XFS', 'temp' => '', 'device' => ''];
+
         $raw[] = [
-            'name'    => basename($mount),
+            'name'    => $name,
             'mount'   => $mount,
+            'fsType'  => $meta['fsType'],
+            'temp'    => $meta['temp'],
             'size_kb' => (int)($total / 1024),
             'used_kb' => (int)($used  / 1024),
             'free_kb' => (int)($free  / 1024),
-            'pct'     => ($total > 0) ? (int)round($used * 100 / $total) : 0,
+            'pct'     => $pct,
             'role'    => 'balanced',
+            'delta_kb'=> 0,
         ];
     }
 
     $target_pct = ($total_size > 0) ? (int)round($total_used * 100 / $total_size) : 0;
 
     foreach ($raw as &$d) {
-        if      ($d['pct'] > $target_pct + $tolerance) $d['role'] = 'source';
-        elseif  ($d['pct'] < $target_pct - $tolerance) $d['role'] = 'destination';
+        $target_used_kb = (int)($d['size_kb'] * $target_pct / 100);
+        $d['delta_kb'] = $d['used_kb'] - $target_used_kb;
+
+        if ($d['pct'] > $target_pct + $tolerance) {
+            $d['role'] = 'source';
+        } elseif ($d['pct'] < $target_pct - $tolerance) {
+            $d['role'] = 'destination';
+        }
     }
     unset($d);
 
     return ['disks' => array_values($raw), 'target_pct' => $target_pct];
 }
 
-function get_recent_log(int $lines = 60): array {
+function get_recent_log(int $lines = 80): array {
     if (!file_exists(LOG_FILE)) return [];
     $data = @file(LOG_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
     if (!$data) return [];
     return array_values(array_slice($data, -$lines));
 }
 
-function get_plan_items(int $max = 200): array {
+function get_plan_items(int $max = 500): array {
     if (!file_exists(PLAN_FILE)) return [];
     $data = json_decode(@file_get_contents(PLAN_FILE), true);
     if (!is_array($data)) return [];
@@ -122,14 +155,40 @@ function idle_payload(int $tolerance, ?array $existing = null): array {
     ];
 
     if ($existing && in_array($existing['state'] ?? '', ['completed', 'stopped', 'planned', 'error', 'done'])) {
-        $base['state']       = ($existing['state'] === 'done') ? 'completed' : $existing['state'];
-        $base['stats']       = $existing['stats']       ?? $base['stats'];
-        $base['plan_count']  = $existing['plan_count']  ?? count($existing['plan'] ?? []);
-        $base['plan']        = !empty($existing['plan']) ? $existing['plan'] : get_plan_items();
-        $base['log']         = get_recent_log();
-        $base['dry_run']     = $existing['dry_run']     ?? false;
-        $base['tolerance']   = $existing['tolerance']   ?? $tolerance;
-        $base['disks']       = !empty($existing['disks']) ? $existing['disks'] : $stats['disks'];
+        $base['state'] = ($existing['state'] === 'done') ? 'completed' : $existing['state'];
+
+        $st = $existing['stats'] ?? [];
+        $base['stats'] = [
+            'files_total'         => $st['files_total'] ?? ($existing['groups_total'] ?? 0),
+            'files_done'          => $st['files_done'] ?? ($existing['groups_done'] ?? 0),
+            'files_skipped'       => $st['files_skipped'] ?? ($existing['groups_failed'] ?? 0),
+            'bytes_total_kb'      => $st['bytes_total_kb'] ?? ($existing['bytes_total_kb'] ?? 0),
+            'bytes_done_kb'       => $st['bytes_done_kb'] ?? ($existing['bytes_done_kb'] ?? 0),
+            'pct_done'            => $st['pct_done'] ?? ($existing['pct_done'] ?? 0),
+            'rate_kbs'            => $st['rate_kbs'] ?? ($existing['overall_rate_mbs'] ? (int)($existing['overall_rate_mbs'] * 1024) : 0),
+            'eta_sec'             => $st['eta_sec'] ?? ($existing['eta_sec'] ?? 0),
+            'multi_linked_groups' => $st['multi_linked_groups'] ?? ($existing['multi_linked_groups'] ?? 0),
+            'multi_linked_kb'     => $st['multi_linked_kb'] ?? ($existing['multi_linked_kb'] ?? 0),
+        ];
+
+        $base['plan_count'] = $existing['plan_count'] ?? ($existing['groups_total'] ?? count($existing['plan'] ?? []));
+        $base['plan']       = !empty($existing['plan']) ? $existing['plan'] : get_plan_items();
+        $base['log']        = get_recent_log();
+        $base['dry_run']    = $existing['dry_run'] ?? false;
+        $base['tolerance']  = $existing['tolerance'] ?? $tolerance;
+        $base['disks']      = !empty($existing['disks']) ? $existing['disks'] : $stats['disks'];
+
+        $meta = get_disk_meta();
+        foreach ($base['disks'] as &$d) {
+            if (empty($d['fsType']) && isset($meta[$d['name']])) {
+                $d['fsType'] = $meta[$d['name']]['fsType'];
+            }
+            if (!isset($d['delta_kb'])) {
+                $t_kb = (int)($d['size_kb'] * $base['target_pct'] / 100);
+                $d['delta_kb'] = $d['used_kb'] - $t_kb;
+            }
+        }
+        unset($d);
     }
 
     return $base;
@@ -155,7 +214,15 @@ function json_out($data): void {
 
 try {
 
+$var = @parse_ini_file('/var/local/emhttp/var.ini') ?: [];
+$csrf_expected = $var['csrf_token'] ?? '';
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!empty($csrf_expected) && isset($_POST['csrf_token']) && $_POST['csrf_token'] !== $csrf_expected) {
+        json_out(['success' => false, 'msg' => 'Invalid CSRF token']);
+        exit;
+    }
+
     $action      = $_POST['action']       ?? '';
     $tolerance   = max(1, min(20, (int)($_POST['tolerance'] ?? 2)));
     $dry_run     = !empty($_POST['dry_run']);
@@ -228,7 +295,7 @@ if (is_running()) {
     if (file_exists(STATUS_FILE)) {
         $curr = json_decode(@file_get_contents(STATUS_FILE), true) ?: [];
         if (empty($curr['plan'])) {
-            $curr['plan'] = get_plan_items(100);
+            $curr['plan'] = get_plan_items(200);
         }
         $curr['log'] = get_recent_log(50);
         json_out($curr);
