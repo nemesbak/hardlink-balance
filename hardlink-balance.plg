@@ -3,9 +3,9 @@
   <!ENTITY name       "hardlink-balance">
   <!ENTITY author     "nemes">
   <!ENTITY version    "2026.10.30">
-  <!ENTITY pluginURL  "https://raw.githubusercontent.com/nemesbak/hardlink-balance/main/hardlink_balance.plg">
+  <!ENTITY github     "nemesbak/hardlink-balance">
+  <!ENTITY pluginURL  "https://raw.githubusercontent.com/&github;/main/hardlink-balance.plg">
   <!ENTITY pluginDir  "/usr/local/emhttp/plugins/&name;">
-  <!ENTITY emhttpDir  "/usr/local/emhttp/plugins/&name;">
   <!ENTITY bootDir    "/boot/config/plugins/&name;">
 ]>
 
@@ -16,38 +16,66 @@
   pluginURL="&pluginURL;"
   min="6.12"
   icon="/plugins/&name;/images/hardlink-balance.png"
-  support="https://github.com/nemesbak/hardlink-balance/issues"
+  support="https://github.com/&github;/issues"
 >
 
 <CHANGES>
 ##2026.10.30
 - Initial official release of Hardlink Balance for Unraid.
-- Hardlink-safe balancer engine grouping by (st_dev, st_ino) to prevent split torrent/media links.
-- Interactive WebGUI dashboard integrated under Tools / Utilities in Unraid.
-- Real-time disk utilization bars with source/destination/balanced indicators.
-- Live progress, transfer speed, elapsed time, and ETA calculations.
-- Hardlink preservation metrics card showing exact groups and GB preserved.
-- Tolerance, minimum file size, and batch limit controls.
-- Integration with Unraid nobody:users (99:100) permission rules to prevent Permission Denied errors.
-- Support for ZFS child datasets (e.g. /mnt/diskN/datos).
+- Hardlink-safe balancer engine grouping files by physical inode (st_dev, st_ino).
+- Completely prevents duplicate space usage between qBittorrent downloads and Radarr/Sonarr/Jellyfin libraries.
+- Native interactive WebGUI dashboard integrated under Tools (Herramientas).
+- Live disk utilization bars, target line, and source/destination/balanced indicators.
+- Real-time progress tracking: transfer speed (MB/s), elapsed time, ETA.
+- Hardlink preservation statistics card (number of groups and GB preserved).
+- Configurable tolerance slider (±1% to ±10%), min file size filter, and transfer limit.
+- Automatic permission enforcement: nobody:users (99:100) 775 to avoid Permission Denied in torrent clients.
+- Fully compatible with XFS arrays and ZFS child datasets (e.g. /mnt/diskN/datos).
 </CHANGES>
 
-<!-- ── Step 1: Create plugin directories ──────────────────────────────────── -->
+<!-- ── Step 1: Pre-install: create directories ────────────────────────────── -->
 <FILE Run="/bin/bash">
 <INLINE>
 mkdir -p &pluginDir;/scripts
 mkdir -p &pluginDir;/images
 mkdir -p &bootDir;/runs
-echo "Directories created for &name;."
 </INLINE>
 </FILE>
 
-<!-- ── Step 2: Post-install setup ─────────────────────────────────────────── -->
+<!-- ── Step 2: Download plugin components ─────────────────────────────────── -->
+<FILE Name="&pluginDir;/HardlinkBalance.page">
+<URL>https://raw.githubusercontent.com/&github;/main/HardlinkBalance.page</URL>
+</FILE>
+
+<FILE Name="&pluginDir;/scripts/hardlink_balance.py" Mode="0755">
+<URL>https://raw.githubusercontent.com/&github;/main/scripts/hardlink_balance.py</URL>
+</FILE>
+
+<FILE Name="&pluginDir;/scripts/status.php" Mode="0644">
+<URL>https://raw.githubusercontent.com/&github;/main/scripts/status.php</URL>
+</FILE>
+
+<FILE Name="&pluginDir;/images/hardlink-balance.png" Mode="0644">
+<URL>https://raw.githubusercontent.com/&github;/main/images/hardlink-balance.png</URL>
+</FILE>
+
+<FILE Name="&pluginDir;/images/hardlink-balance.svg" Mode="0644">
+<URL>https://raw.githubusercontent.com/&github;/main/images/hardlink-balance.svg</URL>
+</FILE>
+
+<!-- ── Step 3: Post-install setup & flash backup ──────────────────────────── -->
 <FILE Run="/bin/bash">
 <INLINE>
 chmod +x &pluginDir;/scripts/hardlink_balance.py
 chmod 644 &pluginDir;/scripts/status.php
 chmod 644 &pluginDir;/HardlinkBalance.page
+chmod 644 &pluginDir;/images/*
+
+# Backup to flash for offline boots
+mkdir -p &bootDir;/scripts &bootDir;/images
+cp -a &pluginDir;/HardlinkBalance.page &bootDir;/
+cp -a &pluginDir;/scripts/* &bootDir;/scripts/
+cp -a &pluginDir;/images/* &bootDir;/images/
 
 echo ""
 echo "-----------------------------------------------------------"
@@ -61,13 +89,14 @@ echo ""
 <!-- ── Removal handler ────────────────────────────────────────────────────── -->
 <FILE Run="/bin/bash" Method="remove">
 <INLINE>
-# Stop any ongoing operation
+# Stop any running process
 if [[ -f /tmp/hardlink_balance.lock ]]; then
     kill "$(cat /tmp/hardlink_balance.lock)" 2>/dev/null
     rm -f /tmp/hardlink_balance.lock
 fi
 
 rm -rf &pluginDir;
+rm -rf &bootDir;
 echo "&name; has been removed."
 </INLINE>
 </FILE>
