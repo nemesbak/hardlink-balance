@@ -1,24 +1,16 @@
 #!/usr/bin/env python3
 """
-hardlink_balance.py — Unraid array disk-usage balancer that never breaks hardlinks.
+hardlink_balance.py / EquiLink — Unraid array disk balancer with hardlink protection.
 
-Unlike the ReBalance/unbalance(d) plugins (which move files one at a time with
-plain rsync -a, silently splitting any hardlinked pair across disks) this script:
-
-  1. Walks each source disk and groups files by (st_dev, st_ino) — i.e. by
-     real hardlink group. A hardlink group can only ever live on ONE physical
-     disk (hardlinks cannot cross filesystems), so this grouping is always
-     disk-local and correct.
-  2. Plans moves at the GROUP level, exactly like the original tolerance-based
-     balancer, but counting each group's size once (shared inode = shared
-     blocks on disk, same as df sees it).
-  3. Executes a move by copying ONE member of the group with rsync, verifying
-     the copy, then recreating every other member of the group as a fresh
-     hardlink (os.link) against that copy at the destination. Only after
-     every member is safely replicated does it remove the originals.
-
-If anything fails partway through a group, nothing is deleted and the group
-is skipped (logged as an error) — originals are left untouched.
+Features & Guarantees:
+  1. Inode-Aware Grouping: groups by (st_dev, st_ino) on each source disk.
+  2. Single-Pass Transfer: copies primary file via rsync, recreates secondary
+     paths via native hardlinks (os.link) on destination.
+  3. Collision Prevention: never overwrites files if destination paths already exist.
+  4. Concurrent Modification Guard: detects if files are modified mid-transfer.
+  5. Nobody:Users (99:100) 775 Permissions: prevents permission errors in qBittorrent/media servers.
+  6. Empty Parent Directory Cleanup: automatically prunes empty folder trees on source disks.
+  7. ZFS & XFS child dataset support: accurate capacity reporting for ZFS datasets.
 """
 
 import argparse
@@ -40,6 +32,20 @@ STATUS_FILE = "/tmp/hardlink_balance_status.json"
 PLAN_FILE = "/tmp/hardlink_balance_plan.json"
 RUNS_DIR = "/mnt/user/appdata/scripts/hardlink_balance_runs"
 
+# Shares/directories that should never be rebalanced automatically
+DEFAULT_EXCLUDE_DIRS = {
+    ".rebalance_stage",
+    ".Trash",
+    ".Recycle.Bin",
+    "system",
+    "appdata",
+    "domains",
+    "isos",
+}
+
+# Minimum safety headroom on destination disks (10 GB)
+MIN_FREE_HEADROOM_KB = 10 * 1024 * 1024
+
 _STOP = False
 
 
@@ -60,7 +66,7 @@ def notify(summary, description, severity="info"):
         "alerts": [{
             "status": "firing",
             "labels": {
-                "alertname": "HardlinkBalance",
+                "alertname": "EquiLink",
                 "severity": severity,
                 "container": "hardlink_balance",
                 "instance": "Unraid · Odin",
@@ -84,8 +90,7 @@ def notify(summary, description, severity="info"):
 
 def makedirs_nobody(d):
     """Como os.makedirs, pero las carpetas NUEVAS quedan nobody:users 775 (este script corre como root).
-    Sin esto, qBittorrent (usuario nobody) no puede borrar luego lo que hay dentro: 'Permission denied'
-    al quitar un torrent con sus datos -> huerfanos en disco."""
+    Sin esto, qBittorrent (usuario nobody) no puede borrar luego lo que hay dentro: 'Permission denied'."""
     nuevas, x = [], d
     while x and not os.path.exists(x):
         nuevas.append(x)
@@ -97,6 +102,21 @@ def makedirs_nobody(d):
             os.chmod(x, 0o775)
         except OSError:
             pass
+
+
+def cleanup_empty_parents(path, mount):
+    """
+    Remove empty parent directories up to the mount point.
+    os.rmdir only removes if directory is completely empty; stops at first non-empty directory.
+    """
+    curr = os.path.dirname(os.path.abspath(path))
+    mount_abs = os.path.abspath(mount)
+    while curr and curr != mount_abs and curr.startswith(mount_abs):
+        try:
+            os.rmdir(curr)
+            curr = os.path.dirname(curr)
+        except OSError:
+            break
 
 
 def write_json_atomic(path, data):
@@ -147,11 +167,36 @@ def _statvfs_path_for(mount):
     return mount
 
 
-def discover_disks():
-    """Return dict: name -> {name, mount, size_kb, used_kb, free_kb, pct}"""
+def get_disk_fstype(disk_name):
+    ini_path = "/var/local/emhttp/disks.ini"
+    if not os.path.exists(ini_path):
+        return "XFS"
+    try:
+        with open(ini_path) as f:
+            in_section = False
+            for line in f:
+                line = line.strip()
+                if line.startswith(f'["{disk_name}"]') or line.startswith(f'[{disk_name}]'):
+                    in_section = True
+                    continue
+                if in_section and line.startswith("["):
+                    break
+                if in_section and line.startswith("fsType="):
+                    return line.split("=", 1)[1].strip('"').upper()
+    except Exception:
+        pass
+    return "XFS"
+
+
+def discover_disks(exclude_disks=None):
+    """Return dict: name -> {name, mount, fsType, size_kb, used_kb, free_kb, pct}"""
+    if exclude_disks is None:
+        exclude_disks = set()
     disks = {}
     for entry in sorted(os.listdir("/mnt")):
         if not DISK_NAME_RE.match(entry):
+            continue
+        if entry in exclude_disks:
             continue
         mount = os.path.join("/mnt", entry)
         if not (os.path.ismount(mount) or os.path.isdir(mount)):
@@ -169,6 +214,7 @@ def discover_disks():
         disks[entry] = {
             "name": entry,
             "mount": mount,
+            "fsType": get_disk_fstype(entry),
             "size_kb": size_kb,
             "used_kb": used_kb,
             "free_kb": free_kb,
@@ -177,15 +223,23 @@ def discover_disks():
     return disks
 
 
-def scan_disk_groups(mount, min_size_kb):
+def scan_disk_groups(mount, min_size_kb, exclude_dirs=None):
     """
     Walk one disk mount and group regular files by (dev, ino).
     Returns dict: (dev, ino) -> {"size_kb": int, "paths": [abs paths]}
     Symlinks and non-regular files are skipped entirely.
     """
+    if exclude_dirs is None:
+        exclude_dirs = DEFAULT_EXCLUDE_DIRS
+
     groups = defaultdict(lambda: {"size_kb": 0, "paths": []})
     for root, dirs, files in os.walk(mount, followlinks=False):
-        dirs[:] = [d for d in dirs if not d.startswith(".rebalance_stage")]
+        # Exclude system and hidden shares at the root of the mount
+        if root == mount:
+            dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith(".")]
+        else:
+            dirs[:] = [d for d in dirs if not d.startswith(".rebalance_stage")]
+
         for name in files:
             path = os.path.join(root, name)
             try:
@@ -266,7 +320,8 @@ def build_plan(disks, tolerance, min_size_kb, limit_kb=None, run_start0=None):
                     continue
                 if d["pct"] >= target_pct + tolerance:
                     continue
-                if d["free_kb"] < size_kb:
+                # Ensure destination has space PLUS safety headroom
+                if d["free_kb"] - size_kb < MIN_FREE_HEADROOM_KB:
                     continue
                 new_pct = (d["used_kb"] + size_kb) * 100 // d["size_kb"]
                 if new_pct > target_pct + tolerance:
@@ -305,14 +360,20 @@ def _build_disks_list(disks, target_pct, tolerance):
             role = "source"
         elif d["pct"] < target_pct - tolerance:
             role = "destination"
+
+        target_used_kb = (d["size_kb"] * target_pct) // 100
+        delta_kb = d["used_kb"] - target_used_kb
+
         out.append({
             "name": name,
             "mount": d["mount"],
+            "fsType": d.get("fsType", "XFS"),
             "size_kb": d["size_kb"],
             "used_kb": d["used_kb"],
             "free_kb": d["free_kb"],
             "pct": d["pct"],
             "role": role,
+            "delta_kb": delta_kb,
         })
     return out
 
@@ -342,6 +403,16 @@ def rel_to_mount(path, mount):
 
 
 def execute_group(group, disks):
+    """
+    Executes a move for an entire hardlink group:
+      1. Verifies no collision exists at destination.
+      2. Records source stat (size, mtime) to detect concurrent modifications.
+      3. Rsyncs the primary file.
+      4. Verifies size and checks that source wasn't modified mid-copy.
+      5. Recreates hardlinks for all other group members on destination disk.
+      6. Verifies all links and removes originals.
+      7. Prunes empty parent directories on source disk.
+    """
     src_mount = disks[group["src_disk"]]["mount"]
     dst_mount = disks[group["dst_disk"]]["mount"]
     paths = group["paths"]
@@ -349,10 +420,25 @@ def execute_group(group, disks):
 
     rel_primary = rel_to_mount(primary, src_mount)
     dst_primary = os.path.join(dst_mount, rel_primary)
+
+    # Collision guard
+    if os.path.exists(dst_primary):
+        log(f"  SKIPPED collision: destination file already exists: {dst_primary}")
+        return False, None
+
+    for p in paths[1:]:
+        rel = rel_to_mount(p, src_mount)
+        dp = os.path.join(dst_mount, rel)
+        if os.path.exists(dp):
+            log(f"  SKIPPED collision: destination link already exists: {dp}")
+            return False, None
+
     makedirs_nobody(os.path.dirname(dst_primary))
 
     try:
-        orig_size = os.path.getsize(primary)
+        orig_stat = os.stat(primary)
+        orig_size = orig_stat.st_size
+        orig_mtime = orig_stat.st_mtime
     except OSError as e:
         log(f"  ERROR stat {primary}: {e}")
         return False, None
@@ -379,6 +465,19 @@ def execute_group(group, disks):
             pass
         return False, None
 
+    # Concurrent modification check
+    try:
+        check_stat = os.stat(primary)
+        if check_stat.st_size != orig_size or check_stat.st_mtime != orig_mtime:
+            log(f"  SKIPPED concurrent modification: file was modified mid-transfer: {primary}")
+            try:
+                os.remove(dst_primary)
+            except OSError:
+                pass
+            return False, None
+    except OSError:
+        pass
+
     dst_paths = [dst_primary]
     ok = True
     for p in paths[1:]:
@@ -403,9 +502,11 @@ def execute_group(group, disks):
                 pass
         return False, None
 
+    # Everything verified — remove originals and prune empty directories
     for p in paths:
         try:
             os.remove(p)
+            cleanup_empty_parents(p, src_mount)
         except OSError as e:
             log(f"  WARNING could not remove original {p}: {e}")
 
@@ -420,6 +521,7 @@ def main():
     ap.add_argument("--tolerance", type=int, default=2, help="target +/- percent (default 2)")
     ap.add_argument("--min-size-kb", type=int, default=0, help="skip files smaller than this")
     ap.add_argument("--limit-gb", type=float, default=None, help="cap total plan size (for a safe test run)")
+    ap.add_argument("--exclude-disks", type=str, default="", help="comma-separated disk names to exclude (e.g. disk8)")
     ap.add_argument("--execute", action="store_true", help="actually move data (default is dry-run)")
     ap.add_argument("--dry-run", action="store_true", help="dry-run only (default)")
     ap.add_argument("--stop", action="store_true", help="stop currently running instance")
@@ -440,6 +542,7 @@ def main():
             sys.exit(1)
 
     limit_kb = int(args.limit_gb * 1024 * 1024) if args.limit_gb else None
+    exclude_disks = {d.strip() for d in args.exclude_disks.split(",") if d.strip()}
 
     if os.path.exists(LOCK_FILE):
         try:
@@ -455,11 +558,11 @@ def main():
 
     try:
         run_start0 = time.time()
-        disks = discover_disks()
-        log(f"Found {len(disks)} data disks: {', '.join(sorted(disks))}")
+        disks = discover_disks(exclude_disks)
+        log(f"Found {len(disks)} active data disks: {', '.join(sorted(disks))}")
         for name in sorted(disks):
             d = disks[name]
-            log(f"  {name}: {d['pct']}% used ({fmt_kb(d['used_kb'])} / {fmt_kb(d['size_kb'])})")
+            log(f"  {name} ({d['fsType']}): {d['pct']}% used ({fmt_kb(d['used_kb'])} / {fmt_kb(d['size_kb'])})")
 
         plan, disks, target_pct = build_plan(disks, args.tolerance, args.min_size_kb, limit_kb, run_start0)
         if not plan:
@@ -625,7 +728,7 @@ def main():
             "tolerance": args.tolerance,
             "target_pct": target_pct,
             "elapsed_sec": int(elapsed_total),
-            "disks": _build_disks_list(discover_disks(), target_pct, args.tolerance),
+            "disks": _build_disks_list(discover_disks(exclude_disks), target_pct, args.tolerance),
             "plan_count": len(plan),
             "plan": plan_export[:100],
             "stats": {
@@ -671,13 +774,13 @@ def main():
             log(f"WARNING could not save run report: {e}")
 
         if args.execute:
-            disks_after = discover_disks()
+            disks_after = discover_disks(exclude_disks)
             after_lines = "\n".join(
                 f"{n}: {disks_after[n]['pct']}%" for n in sorted(disks_after)
             )
             if failed > 0 or stopped_early:
                 notify(
-                    f"hardlink_balance: {'parado' if stopped_early else 'terminado con fallos'} "
+                    f"EquiLink: {'parado' if stopped_early else 'terminado con fallos'} "
                     f"({done} ok, {failed} fallidos)",
                     f"{fmt_kb(freed_kb)} movidos en {elapsed_total/60:.1f} min.\n"
                     f"Discos tras la pasada:\n{after_lines}\n"
@@ -687,7 +790,7 @@ def main():
             else:
                 avg_mbs = (freed_kb / 1024) / elapsed_total if elapsed_total > 0 else 0
                 notify(
-                    f"hardlink_balance: terminado OK ({done} grupos, {fmt_kb(freed_kb)})",
+                    f"EquiLink: terminado OK ({done} grupos, {fmt_kb(freed_kb)})",
                     f"{elapsed_total/60:.1f} min, {avg_mbs:.0f} MB/s promedio.\n"
                     f"Discos tras la pasada:\n{after_lines}",
                     severity="info",
