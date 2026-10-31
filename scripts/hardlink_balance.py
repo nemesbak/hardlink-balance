@@ -529,21 +529,28 @@ def clean_stale_temps(mount):
 def build_plan(disks, tolerance, min_size_kb, min_age_s, limit_kb=None, run_start0=None):
     total_size = sum(d["size_kb"] for d in disks.values())
     total_used = sum(d["used_kb"] for d in disks.values())
-    target_pct = (total_used * 100 // total_size) if total_size else 0
-    log(f"Target: {target_pct}%  |  Tolerance: +/-{tolerance}%")
-
-    sources = sorted(
-        [name for name, d in disks.items() if d["pct"] > target_pct + tolerance],
-        key=lambda n: -disks[n]["pct"],
-    )
-    if not sources:
-        log("All disks within tolerance. Nothing to do.")
-        return [], disks, target_pct
+    # Exact (float) fill for planning; whole percents are only for display. A disk under
+    # the band is as unbalanced as one over it, so disks above the target keep giving
+    # data while any disk sits below target - tolerance.
+    tgt = (total_used * 100 / total_size) if total_size else 0.0
+    target_pct = int(tgt)
+    log(f"Target: {tgt:.1f}%  |  Tolerance: +/-{tolerance}%")
 
     vstate = {name: dict(d) for name, d in disks.items()}
 
-    def pct_with(d, delta_kb):
-        return (d["used_kb"] + delta_kb) * 100 // d["size_kb"]
+    def fpct(d, delta_kb=0):
+        return (d["used_kb"] + delta_kb) * 100 / d["size_kb"]
+
+    def any_under():
+        return any(fpct(d) < tgt - tolerance for d in vstate.values())
+
+    def must_shed(d):
+        return fpct(d) > tgt + tolerance or (fpct(d) > tgt and any_under())
+
+    sources = sorted([name for name, d in vstate.items() if must_shed(d)], key=lambda n: -fpct(vstate[n]))
+    if not sources:
+        log("All disks within tolerance. Nothing to do.")
+        return [], disks, target_pct
 
     plan = []
     plan_total_kb = 0
@@ -554,10 +561,10 @@ def build_plan(disks, tolerance, min_size_kb, min_age_s, limit_kb=None, run_star
         if limit_hit:
             break
         s = vstate[src]
-        if s["pct"] <= target_pct + tolerance:
+        if not must_shed(s):
             continue
-        need_kb = (s["pct"] - target_pct) * s["size_kb"] // 100
-        log(f"Scanning {src} ({s['pct']}%, need to shed ~{fmt_kb(need_kb)})...")
+        need_kb = int((fpct(s) - tgt) * s["size_kb"] / 100)
+        log(f"Scanning {src} ({fpct(s):.1f}%, up to ~{fmt_kb(need_kb)} to shed)...")
 
         if run_start0:
             write_json_atomic(STATUS_FILE, {
@@ -581,7 +588,7 @@ def build_plan(disks, tolerance, min_size_kb, min_age_s, limit_kb=None, run_star
             + (f"; skipped {skipped}" if skipped else ""))
 
         for u in units:
-            if s["pct"] <= target_pct + tolerance:
+            if not must_shed(s):
                 break
             if limit_kb is not None and plan_total_kb >= limit_kb:
                 limit_hit = True
@@ -590,7 +597,7 @@ def build_plan(disks, tolerance, min_size_kb, min_age_s, limit_kb=None, run_star
             if limit_kb is not None and plan_total_kb + size_kb > limit_kb:
                 continue            # this folder would overshoot the cap; a smaller one may still fit
             # Don't overshoot the source below the band
-            if pct_with(s, -size_kb) < target_pct - tolerance:
+            if fpct(s, -size_kb) < tgt - tolerance:
                 continue
 
             rels = [rel_to_mount(p, s["mount"]) for g in u["groups"] for p in g["paths"]]
@@ -607,9 +614,9 @@ def build_plan(disks, tolerance, min_size_kb, min_age_s, limit_kb=None, run_star
                     continue        # same path already on that disk: would collide
                 if d["free_kb"] - size_kb < MIN_FREE_HEADROOM_KB:
                     continue
-                if pct_with(d, size_kb) > target_pct + tolerance:
+                if fpct(d, size_kb) > tgt + tolerance:
                     continue
-                if best is None or d["pct"] < vstate[best]["pct"]:
+                if best is None or fpct(d) < fpct(vstate[best]):
                     best = dname
             if best is None:
                 continue
