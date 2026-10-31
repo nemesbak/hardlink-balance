@@ -4,1063 +4,594 @@ Tag="balance-scale"
 Icon="images/hardlink-balance.png"
 ---
 <?php
-/* EquiLink — Unraid Array Disk Usage Balancer with Hardlink Protection */
-$plugin  = "hardlink-balance";
-$docroot = $docroot ?? $_SERVER['DOCUMENT_ROOT'] ?: '/usr/local/emhttp';
-$var     = @parse_ini_file('/var/local/emhttp/var.ini') ?: [];
-$csrf    = $var['csrf_token'] ?? '';
+/* EquiLink — Unraid array balancer that keeps hardlinks together */
+$var   = @parse_ini_file('/var/local/emhttp/var.ini') ?: [];
+$csrf  = $var['csrf_token'] ?? '';
+$theme = $display['theme'] ?? (@parse_ini_file('/boot/config/plugins/dynamix/dynamix.cfg', true)['display']['theme'] ?? 'white');
+$dark  = in_array($theme, ['black', 'gray'], true);
 ?>
-<!DOCTYPE html>
-<html>
-<head>
 <style>
-/* ── Theme variables ─────────────────────────────────────────────────────── */
-:root {
-    --el-bg:          #ffffff;
-    --el-bg-alt:      #f8fafc;
-    --el-bg-card:     #ffffff;
-    --el-border:      #e2e8f0;
-    --el-border-subtle:#f1f5f9;
-    --el-text:        #0f172a;
-    --el-text-muted:  #64748b;
-    --el-accent:      #10b981;
-    --el-accent-hover:#059669;
-    --el-cyan:        #0284c7;
-    --el-bar-track:   #e2e8f0;
-    --el-bar-target:  #0f172a;
-    --el-source:      #ef4444;
-    --el-dest:        #10b981;
-    --el-badge-fs:    #f1f5f9;
+/* Layout: one operator column — summary strip, disk instrument (bars + target band), run + routes, guards, moves, settings, history. */
+#hlb{
+  --bg:#eef1f4; --panel:#ffffff; --panel-2:#f5f7f9; --line:#d9dfe6; --fg:#16202b; --muted:#5d6b7a;
+  --accent:#c4621d; --on-accent:#ffffff;
+  --src:#c8432f; --src-soft:#f7dcd6; --dst:#11806f; --dst-soft:#d3eee9; --ok:#3a8a3f; --ok-soft:#dcefdc;
+  --warn:#a87308; --warn-soft:#f6ecd0; --off:#8a96a3; --off-soft:#e6eaee;
+  --band:rgba(196,98,29,.13); --track:#e4e9ee;
+  --f-mono:ui-monospace,"SFMono-Regular","Cascadia Mono",Consolas,monospace;
+  --r:10px;
+  color:var(--fg); background:var(--bg); font-size:14px; line-height:1.5; padding:16px; border-radius:12px;
+  display:grid; gap:16px; margin:8px 0 24px;
 }
+#hlb.hlb-dark{
+  --bg:#0f141a; --panel:#161d25; --panel-2:#1b242e; --line:#28333f; --fg:#e4eaf0; --muted:#8d9bab;
+  --accent:#e98a45; --on-accent:#1a1006;
+  --src:#ef6b55; --src-soft:#3b1f1a; --dst:#3cc2ab; --dst-soft:#123430; --ok:#6cc072; --ok-soft:#183019;
+  --warn:#e0ad3c; --warn-soft:#352a12; --off:#6c7987; --off-soft:#212a34;
+  --band:rgba(233,138,69,.15); --track:#222c37;
+}
+#hlb *{box-sizing:border-box}
+#hlb h2,#hlb h3{margin:0;font-weight:700;color:var(--fg);text-wrap:balance}
+#hlb h2{font-size:15px;letter-spacing:.01em}
+#hlb .num,#hlb .mono{font-family:var(--f-mono);font-variant-numeric:tabular-nums}
+#hlb .eyebrow{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);font-weight:600}
+#hlb .sub{color:var(--muted);font-size:12.5px}
+#hlb .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);min-width:0}
+#hlb .phead{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+#hlb .pbody{padding:16px}
+#hlb :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#hlb button,#hlb input,#hlb select{font:inherit;color:var(--fg);margin:0;min-width:0;text-transform:none;letter-spacing:normal}
+#hlb button{cursor:pointer}
+#hlb input[type=number],#hlb input[type=text],#hlb input[type=url],#hlb input[type=search],#hlb select{
+  background:var(--panel-2);border:1px solid var(--line);border-radius:7px;padding:7px 10px;width:100%;height:auto;box-shadow:none}
+#hlb input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px;margin:0}
+#hlb input[type=range]{accent-color:var(--accent);width:100%;margin:0;padding:0;border:0;background:none}
 
-.el-dark {
-    --el-bg:          #0f172a;
-    --el-bg-alt:      #1e293b;
-    --el-bg-card:     #1e293b;
-    --el-border:      #334155;
-    --el-border-subtle:#1e293b;
-    --el-text:        #f8fafc;
-    --el-text-muted:  #94a3b8;
-    --el-accent:      #10b981;
-    --el-accent-hover:#34d399;
-    --el-cyan:        #38bdf8;
-    --el-bar-track:   #334155;
-    --el-bar-target:  #f8fafc;
-    --el-source:      #f87171;
-    --el-dest:        #34d399;
-    --el-badge-fs:    #334155;
-}
+/* header */
+#hlb .top{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+#hlb .brand{display:flex;gap:12px;align-items:center}
+#hlb .logo{width:40px;height:40px;border-radius:9px;background:var(--fg);display:grid;place-items:center;flex:none}
+#hlb .logo svg{width:24px;height:24px}
+#hlb .brand b{display:block;font-size:22px;font-weight:800;letter-spacing:-.01em;line-height:1.1}
+#hlb .actions{display:flex;gap:8px;flex-wrap:wrap}
+#hlb .btn{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:8px 15px;font-weight:600;white-space:nowrap;font-size:13px;line-height:1.2}
+#hlb .btn:hover{border-color:var(--muted)}
+#hlb .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+#hlb .btn.danger{color:var(--src);border-color:var(--src)}
+#hlb .btn.confirm{background:var(--src);border-color:var(--src);color:#fff}
+#hlb .btn[disabled]{opacity:.5;cursor:not-allowed}
 
-/* ── Container styles ────────────────────────────────────────────────────── */
-#el-wrap {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    color: var(--el-text);
-    margin: 10px 0 40px;
-    font-size: 13.5px;
-    line-height: 1.5;
-}
+/* summary strip */
+#hlb .strip{display:grid;grid-template-columns:1.4fr repeat(4,1fr)}
+#hlb .strip>div{padding:14px 16px;border-right:1px solid var(--line);min-width:0}
+#hlb .strip>div:last-child{border-right:0}
+#hlb .kv{font-size:24px;font-weight:700;line-height:1.15;font-variant-numeric:tabular-nums;color:var(--fg)}
+#hlb .kv small{font-size:13px;color:var(--muted);font-weight:500;margin-left:3px}
+#hlb .state{display:flex;gap:10px;align-items:center}
+#hlb .dot{width:10px;height:10px;border-radius:50%;background:var(--off);flex:none}
+#hlb .state[data-s="running"] .dot,#hlb .state[data-s="planning"] .dot,#hlb .state[data-s="starting"] .dot{background:var(--accent);animation:hlbpulse 1.6s infinite}
+#hlb .state[data-s="planned"] .dot{background:var(--warn)}
+#hlb .state[data-s="completed"] .dot{background:var(--ok)}
+#hlb .state[data-s="stopped"] .dot,#hlb .state[data-s="error"] .dot{background:var(--src)}
+@keyframes hlbpulse{0%{box-shadow:0 0 0 0 var(--band)}70%{box-shadow:0 0 0 9px transparent}100%{box-shadow:0 0 0 0 transparent}}
+@media (prefers-reduced-motion:reduce){#hlb *{animation:none!important;transition:none!important}}
 
-/* ── Top Header Bar ──────────────────────────────────────────────────────── */
-.el-header-hero {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    background: linear-gradient(135deg, rgba(16,185,129,0.12) 0%, rgba(2,132,199,0.08) 100%);
-    border: 1px solid rgba(16,185,129,0.25);
-    border-radius: 10px;
-    padding: 16px 22px;
-    margin-bottom: 20px;
-}
-.el-header-title {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-}
-.el-header-title h2 {
-    margin: 0;
-    font-size: 20px;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-}
-.el-header-badges {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    flex-wrap: wrap;
-}
+/* banner */
+#hlb .banner{padding:10px 14px;border-radius:8px;font-size:13px;border:1px solid}
+#hlb .banner.warn{background:var(--warn-soft);color:var(--warn);border-color:var(--warn)}
+#hlb .banner.err{background:var(--src-soft);color:var(--src);border-color:var(--src)}
+#hlb .banner.ok{background:var(--ok-soft);color:var(--ok);border-color:var(--ok)}
 
-.el-card {
-    background: var(--el-bg-card);
-    border: 1px solid var(--el-border);
-    border-radius: 10px;
-    padding: 20px 22px;
-    margin-bottom: 20px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.03);
-}
+/* disks */
+#hlb .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+#hlb .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+#hlb .disks{display:grid;gap:10px}
+#hlb .disk{display:grid;grid-template-columns:170px 1fr 150px;gap:14px;align-items:center}
+#hlb .dname{display:flex;flex-direction:column;min-width:0}
+#hlb .dname b{font-size:15px}
+#hlb .dname span{font-size:12px;color:var(--muted)}
+#hlb .bar{position:relative;height:26px;background:var(--track);border-radius:5px;overflow:hidden}
+#hlb .band{position:absolute;top:0;bottom:0;background:var(--band);border-left:1px dashed var(--accent);border-right:1px dashed var(--accent)}
+#hlb .fill{position:absolute;left:0;top:5px;bottom:5px;border-radius:3px;transition:width .6s ease}
+#hlb .ghost{position:absolute;left:0;top:0;bottom:0;border-right:2px solid var(--fg);opacity:.55}
+#hlb .ghost::after{content:"";position:absolute;right:-5px;top:-1px;border:4px solid transparent;border-top-color:var(--fg)}
+#hlb .target{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--accent)}
+#hlb .disk.excluded .bar{opacity:.45}
+#hlb .dstat{text-align:right;font-family:var(--f-mono);font-size:12.5px;font-variant-numeric:tabular-nums}
+#hlb .dstat b{font-size:15px;font-weight:700}
+#hlb .pill{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:99px;letter-spacing:.02em;line-height:1.5;white-space:nowrap}
+#hlb .p-src{background:var(--src-soft);color:var(--src)} #hlb .p-dst{background:var(--dst-soft);color:var(--dst)}
+#hlb .p-ok{background:var(--ok-soft);color:var(--ok)} #hlb .p-warn{background:var(--warn-soft);color:var(--warn)}
+#hlb .p-off{background:var(--off-soft);color:var(--off)}
+#hlb .axis{display:grid;grid-template-columns:170px 1fr 150px;gap:14px;font-size:11px;color:var(--muted);font-family:var(--f-mono)}
+#hlb .axis div:nth-child(2){position:relative;height:14px}
+#hlb .axis span{position:absolute;transform:translateX(-50%)}
 
-.el-card-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    border-bottom: 1px solid var(--el-border);
-    padding-bottom: 12px;
-    margin-bottom: 16px;
-}
-.el-card-header h3 {
-    margin: 0;
-    font-size: 15.5px;
-    font-weight: 600;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
+#hlb .cols{display:grid;grid-template-columns:1.25fr 1fr;gap:16px}
+#hlb .cols>*{min-width:0}
 
-/* ── Badges ──────────────────────────────────────────────────────────────── */
-.el-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 2px 8px;
-    border-radius: 9999px;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-}
-.el-pill-source { background: #fee2e2; color: #b91c1c; }
-.el-pill-dest   { background: #dcfce7; color: #15803d; }
-.el-pill-bal    { background: #f1f5f9; color: #475569; }
-.el-pill-fs     { background: var(--el-badge-fs); color: var(--el-text-muted); font-size: 10px; padding: 1px 6px; }
-.el-pill-link   { background: #e0f2fe; color: #0369a1; }
-.el-pill-shield { background: #d1fae5; color: #065f46; font-size: 12px; padding: 4px 10px; }
+/* run */
+#hlb .big{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+#hlb .big .kv{font-size:36px}
+#hlb .prog{height:12px;background:var(--track);border-radius:6px;overflow:hidden;margin:10px 0 6px}
+#hlb .prog i{display:block;height:100%;background:var(--accent);border-radius:6px;transition:width .5s}
+#hlb .minis{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px}
+#hlb .mini{background:var(--panel-2);border-radius:8px;padding:10px 12px;min-width:0}
+#hlb .mini .kv{font-size:18px}
+#hlb .current{margin-top:14px;font-family:var(--f-mono);font-size:12px;background:var(--panel-2);border-radius:8px;padding:10px 12px;word-break:break-all}
+#hlb .current .eyebrow{display:block;margin-bottom:4px;font-family:inherit}
+#hlb svg.spark{width:100%;height:56px;display:block;margin-top:12px}
 
-.el-dark .el-pill-source { background: #7f1d1d; color: #fca5a5; }
-.el-dark .el-pill-dest   { background: #064e3b; color: #86efac; }
-.el-dark .el-pill-bal    { background: #334155; color: #cbd5e1; }
-.el-dark .el-pill-link   { background: #0c4a6e; color: #7dd3fc; }
-.el-dark .el-pill-shield { background: #064e3b; color: #a7f3d0; }
+/* flows */
+#hlb .flows{display:grid;gap:8px}
+#hlb .flow{display:grid;grid-template-columns:64px 1fr 64px 90px;align-items:center;gap:10px;font-size:13px}
+#hlb .flow .from{color:var(--src);font-weight:600}
+#hlb .flow .to{color:var(--dst);font-weight:600;text-align:right}
+#hlb .ftrack{height:8px;background:var(--track);border-radius:4px;position:relative;overflow:hidden}
+#hlb .ftrack i{position:absolute;top:0;bottom:0;left:0;border-radius:4px;background:linear-gradient(90deg,var(--src),var(--dst))}
+#hlb .flow .num{text-align:right;color:var(--muted)}
+#hlb .split{display:flex;height:10px;border-radius:5px;overflow:hidden;margin-top:6px;background:var(--track)}
+#hlb .split i{display:block}
+#hlb .empty{color:var(--muted);font-size:13px;padding:6px 0}
 
-/* ── Disk Table ──────────────────────────────────────────────────────────── */
-.el-table {
-    width: 100%;
-    border-collapse: collapse;
-}
-.el-table th {
-    text-align: left;
-    padding: 8px 12px;
-    font-size: 12px;
-    color: var(--el-text-muted);
-    border-bottom: 1px solid var(--el-border);
-    font-weight: 600;
-}
-.el-table td {
-    padding: 11px 12px;
-    border-bottom: 1px solid var(--el-border);
-    vertical-align: middle;
-}
-.el-bar-wrap {
-    position: relative;
-    width: 100%;
-    height: 16px;
-    background: var(--el-bar-track);
-    border-radius: 6px;
-    overflow: hidden;
-}
-.el-bar-fill {
-    height: 100%;
-    border-radius: 6px;
-    transition: width 0.35s ease;
-}
-.el-bar-target-line {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    width: 2px;
-    background: var(--el-bar-target);
-    z-index: 2;
-}
+/* guards + skipped */
+#hlb .guards{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+#hlb .guard{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:8px;min-width:0}
+#hlb .guard .ic{width:22px;height:22px;border-radius:6px;display:grid;place-items:center;flex:none;font-size:13px;font-weight:700}
+#hlb .g-ok .ic{background:var(--ok-soft);color:var(--ok)} #hlb .g-warn .ic{background:var(--warn-soft);color:var(--warn)}
+#hlb .guard b{display:block;font-size:13px}
+#hlb .guard span{font-size:12px;color:var(--muted)}
+#hlb .chips{display:flex;gap:8px;flex-wrap:wrap}
+#hlb .chip{border:1px solid var(--line);border-radius:7px;padding:6px 10px;font-size:12.5px;background:var(--panel-2)}
+#hlb .chip b{font-family:var(--f-mono);margin-right:4px}
+#hlb .note{font-size:12px;color:var(--muted);margin:10px 0 0}
 
-/* ── Shield Callout ──────────────────────────────────────────────────────── */
-.el-shield-card {
-    background: linear-gradient(135deg, rgba(16,185,129,0.08) 0%, rgba(6,182,212,0.05) 100%);
-    border: 1px solid rgba(16,185,129,0.3);
-    border-radius: 10px;
-    padding: 16px 20px;
-    margin-bottom: 20px;
-    display: flex;
-    align-items: center;
-    gap: 18px;
-}
-.el-shield-icon {
-    font-size: 36px;
-    color: var(--el-accent);
-}
-.el-shield-content h4 {
-    margin: 0 0 4px 0;
-    font-size: 15px;
-    color: var(--el-text);
-    font-weight: 600;
-}
-.el-shield-content p {
-    margin: 0;
-    font-size: 12.5px;
-    color: var(--el-text-muted);
-}
+/* table */
+#hlb .tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+#hlb .tools input{width:220px}
+#hlb .chipbtn{border:1px solid var(--line);background:var(--panel);border-radius:7px;padding:5px 10px;font-size:12.5px}
+#hlb .chipbtn[aria-pressed="true"]{border-color:var(--fg);background:var(--fg);color:var(--bg)}
+#hlb .tablewrap{overflow-x:auto;max-height:440px;overflow-y:auto}
+#hlb table{width:100%;border-collapse:collapse;font-size:13px;margin:0;background:none}
+#hlb th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap;position:sticky;top:0;background:var(--panel)}
+#hlb td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--fg)}
+#hlb td.path{font-family:var(--f-mono);font-size:12px;word-break:break-all;min-width:260px}
+#hlb td.r,#hlb th.r{text-align:right}
+#hlb .st-done{color:var(--ok)} #hlb .st-run{color:var(--accent)} #hlb .st-wait{color:var(--muted)} #hlb .st-skip{color:var(--warn)}
 
-/* ── Controls & Buttons ──────────────────────────────────────────────────── */
-.el-controls-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 16px;
-    align-items: center;
-}
-.el-control-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-.el-control-item label {
-    font-weight: 500;
-    font-size: 13px;
-    color: var(--el-text);
-}
-.el-select {
-    background: var(--el-bg);
-    color: var(--el-text);
-    border: 1px solid var(--el-border);
-    padding: 6px 12px;
-    border-radius: 6px;
-    font-size: 13px;
-    outline: none;
-}
-.el-select:focus {
-    border-color: var(--el-accent);
-}
+/* settings */
+#hlb details>summary{list-style:none;cursor:pointer}
+#hlb details>summary::-webkit-details-marker{display:none}
+#hlb .caret{transition:transform .2s;display:inline-block;color:var(--muted)}
+#hlb details[open] .caret{transform:rotate(90deg)}
+#hlb .sgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}
+#hlb .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;font-weight:500}
+#hlb .field .val{font-family:var(--f-mono);font-size:12.5px;float:right;color:var(--fg)}
+#hlb .field .hint{font-size:11.5px;color:var(--muted);margin-top:4px}
+#hlb .group{grid-column:1/-1;display:grid;gap:8px}
+#hlb .checks{display:flex;flex-wrap:wrap;gap:6px}
+#hlb .check{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line);border-radius:7px;padding:6px 10px;font-size:13px;background:var(--panel-2);cursor:pointer}
+#hlb .check.sys{opacity:.75}
+#hlb .sfoot{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
 
-.el-presets-row {
-    margin-top: 14px;
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    font-size: 12px;
-    color: var(--el-text-muted);
-}
-.el-preset-btn {
-    background: var(--el-bg-alt);
-    border: 1px solid var(--el-border);
-    color: var(--el-text);
-    padding: 3px 10px;
-    border-radius: 5px;
-    cursor: pointer;
-    font-size: 11.5px;
-    transition: all 0.15s;
-}
-.el-preset-btn:hover {
-    border-color: var(--el-accent);
-    color: var(--el-accent);
-}
+/* history + log */
+#hlb .hrow{display:grid;grid-template-columns:120px 1fr 90px 110px 96px;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);font-size:13px;align-items:center}
+#hlb .hrow:last-child{border-bottom:0}
+#hlb .hrow .num{text-align:right}
+#hlb pre.console{margin:0;max-height:300px;overflow:auto;background:var(--panel-2);border-radius:8px;padding:12px;font:12px/1.55 var(--f-mono);color:var(--fg);white-space:pre-wrap;word-break:break-all}
 
-.el-actions-row {
-    margin-top: 20px;
-    display: flex;
-    gap: 12px;
-    align-items: center;
-    flex-wrap: wrap;
+@media (max-width:1000px){
+  #hlb .strip{grid-template-columns:1fr 1fr}
+  #hlb .strip>div{border-bottom:1px solid var(--line)}
+  #hlb .strip>div:first-child{grid-column:1/-1}
+  #hlb .cols{grid-template-columns:1fr}
+  #hlb .sgrid{grid-template-columns:1fr 1fr}
 }
-
-.el-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    padding: 9px 20px;
-    font-size: 13px;
-    font-weight: 600;
-    border-radius: 7px;
-    border: none;
-    cursor: pointer;
-    transition: all 0.15s ease;
+@media (max-width:640px){
+  #hlb{padding:10px}
+  #hlb .disk,#hlb .axis{grid-template-columns:1fr;gap:6px}
+  #hlb .axis div:first-child,#hlb .axis div:last-child{display:none}
+  #hlb .dstat{text-align:left}
+  #hlb .guards,#hlb .sgrid{grid-template-columns:1fr}
+  #hlb .minis{grid-template-columns:1fr 1fr}
+  #hlb .hrow{grid-template-columns:1fr 1fr;row-gap:2px}
+  #hlb .hrow .num{text-align:left}
+  #hlb .flow{grid-template-columns:52px 1fr 52px}
+  #hlb .flow .num{grid-column:1/-1;text-align:left}
 }
-.el-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-}
-.el-btn-analyze {
-    background: linear-gradient(180deg, #0284c7 0%, #0369a1 100%);
-    color: #ffffff;
-    box-shadow: 0 1px 2px rgba(2,132,199,0.3);
-}
-.el-btn-analyze:hover:not(:disabled) {
-    background: #0369a1;
-}
-
-.el-btn-start {
-    background: linear-gradient(180deg, #10b981 0%, #059669 100%);
-    color: #ffffff;
-    box-shadow: 0 1px 2px rgba(16,185,129,0.3);
-}
-.el-btn-start:hover:not(:disabled) {
-    background: #059669;
-}
-
-.el-btn-stop {
-    background: linear-gradient(180deg, #ef4444 0%, #dc2626 100%);
-    color: #ffffff;
-}
-.el-btn-stop:hover:not(:disabled) {
-    background: #dc2626;
-}
-
-.el-btn-clear {
-    background: transparent;
-    color: var(--el-text-muted);
-    border: 1px solid var(--el-border);
-}
-.el-btn-clear:hover:not(:disabled) {
-    background: var(--el-bg-alt);
-    color: var(--el-text);
-}
-
-/* ── Stats Dashboard ─────────────────────────────────────────────────────── */
-.el-stats-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 14px;
-    margin-top: 15px;
-}
-.el-stat-box {
-    background: var(--el-bg-alt);
-    border: 1px solid var(--el-border);
-    border-radius: 8px;
-    padding: 14px 16px;
-}
-.el-stat-title {
-    font-size: 11.5px;
-    color: var(--el-text-muted);
-    margin-bottom: 4px;
-    font-weight: 500;
-}
-.el-stat-val {
-    font-size: 20px;
-    font-weight: 700;
-    color: var(--el-text);
-    letter-spacing: -0.01em;
-}
-.el-stat-sub {
-    font-size: 11px;
-    color: var(--el-text-muted);
-    margin-top: 2px;
-}
-
-/* ── Plan Table with Live Search ─────────────────────────────────────────── */
-.el-plan-toolbar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 12px;
-    gap: 12px;
-    flex-wrap: wrap;
-}
-.el-search-input {
-    background: var(--el-bg);
-    color: var(--el-text);
-    border: 1px solid var(--el-border);
-    border-radius: 6px;
-    padding: 6px 12px;
-    font-size: 12.5px;
-    min-width: 260px;
-    outline: none;
-}
-.el-search-input:focus {
-    border-color: var(--el-accent);
-}
-.el-filter-chips {
-    display: flex;
-    gap: 6px;
-    align-items: center;
-}
-.el-chip {
-    padding: 3px 10px;
-    border-radius: 9999px;
-    font-size: 11.5px;
-    cursor: pointer;
-    border: 1px solid var(--el-border);
-    background: var(--el-bg-alt);
-    color: var(--el-text-muted);
-    transition: all 0.15s;
-}
-.el-chip.active {
-    background: var(--el-accent);
-    color: #ffffff;
-    border-color: var(--el-accent);
-}
-
-.el-table-container {
-    max-height: 360px;
-    overflow-y: auto;
-    border: 1px solid var(--el-border);
-    border-radius: 8px;
-}
-
-/* ── Console ─────────────────────────────────────────────────────────────── */
-.el-console-wrap {
-    position: relative;
-}
-.el-console {
-    background: #090d16;
-    color: #a7f3d0;
-    font-family: SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-    font-size: 12px;
-    line-height: 1.45;
-    padding: 14px 16px;
-    border-radius: 8px;
-    max-height: 280px;
-    overflow-y: auto;
-    white-space: pre-wrap;
-    word-break: break-all;
-}
-
-/* ── Banners ─────────────────────────────────────────────────────────────── */
-.el-banner {
-    padding: 14px 18px;
-    border-radius: 8px;
-    margin-bottom: 20px;
-    font-weight: 500;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    font-size: 13.5px;
-}
-.el-banner-info    { background: #e0f2fe; color: #0369a1; border-left: 4px solid #0284c7; }
-.el-banner-success { background: #dcfce7; color: #15803d; border-left: 4px solid #10b981; }
-.el-banner-warn    { background: #fef3c7; color: #92400e; border-left: 4px solid #f59e0b; }
-.el-banner-err     { background: #fee2e2; color: #991b1b; border-left: 4px solid #ef4444; }
-
-.el-dark .el-banner-info    { background: #0c4a6e; color: #bae6fd; }
-.el-dark .el-banner-success { background: #064e3b; color: #a7f3d0; }
-.el-dark .el-banner-warn    { background: #78350f; color: #fde68a; }
-.el-dark .el-banner-err     { background: #7f1d1d; color: #fecaca; }
 </style>
-</head>
-<body>
-<div id="el-wrap">
 
-  <!-- Hero Header -->
-  <div class="el-header-hero">
-    <div class="el-header-title">
-      <img src="/plugins/hardlink-balance/images/hardlink-balance.png" width="36" height="36" style="vertical-align:middle;border-radius:6px;">
-      <div>
-        <h2>EquiLink <span style="font-size:14px;font-weight:normal;color:var(--el-text-muted);">(Hardlink Balance)</span></h2>
-        <div style="font-size:12px;color:var(--el-text-muted);">Unraid Array Disk Usage Balancer with Inode & Hardlink Protection</div>
+<div id="hlb" class="<?= $dark ? 'hlb-dark' : '' ?>">
+  <header class="top">
+    <div class="brand">
+      <div class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="var(--bg)" stroke-width="2.2" stroke-linecap="round"><path d="M4 18V9M10 18V5M16 18v-7M22 18v-4"/><path d="M2 12h20" stroke="var(--accent)" stroke-dasharray="2 2.5"/></svg></div>
+      <div><b>EquiLink</b><span class="sub" id="hlb-sub">Balances array disks without breaking hardlinks</span></div>
+    </div>
+    <div class="actions">
+      <button class="btn" id="hlb-plan" type="button">Simulate</button>
+      <button class="btn primary" id="hlb-run" type="button">Run</button>
+      <button class="btn danger" id="hlb-stop" type="button" hidden>Stop</button>
+      <button class="btn" id="hlb-clear" type="button" hidden>Clear result</button>
+    </div>
+  </header>
+
+  <div id="hlb-banner" class="banner" hidden></div>
+
+  <section class="panel strip" aria-label="Summary">
+    <div>
+      <div class="eyebrow">Status</div>
+      <div class="state" id="hlb-state" data-s="idle"><span class="dot"></span><span class="kv" id="hlb-state-t">Idle</span></div>
+      <div class="sub" id="hlb-state-d">Loading…</div>
+    </div>
+    <div><div class="eyebrow">Target fill</div><div class="kv num" id="k-target">–</div><div class="sub">band ±<span id="k-tol">2</span> %</div></div>
+    <div><div class="eyebrow">Spread</div><div class="kv num" id="k-spread">–</div><div class="sub" id="k-spread-d">fullest vs emptiest</div></div>
+    <div><div class="eyebrow">Planned</div><div class="kv num" id="k-plan">–</div><div class="sub" id="k-plan-d">run Simulate to plan</div></div>
+    <div><div class="eyebrow">Out of band</div><div class="kv num" id="k-out">–</div><div class="sub" id="k-out-d"></div></div>
+  </section>
+
+  <section class="panel" aria-labelledby="h-disks">
+    <div class="phead">
+      <h2 id="h-disks">Disks</h2>
+      <div class="legend">
+        <span><i style="background:var(--src)"></i>Source</span>
+        <span><i style="background:var(--dst)"></i>Destination</span>
+        <span><i style="background:var(--ok)"></i>In band</span>
+        <span><i style="background:var(--off)"></i>Excluded</span>
+        <span><i style="background:var(--band);outline:1px dashed var(--accent)"></i>Target band</span>
+        <span>▾ After plan</span>
       </div>
     </div>
-    <div class="el-header-badges">
-      <span class="el-pill el-pill-shield"><i class="fa fa-shield"></i> Inode-Safe Active</span>
-      <span class="el-pill el-pill-bal">v2026.10.30</span>
-      <span class="el-pill el-pill-bal" id="el-disks-count">8 Disks</span>
-    </div>
-  </div>
+    <div class="pbody disks" id="hlb-disks"></div>
+  </section>
 
-  <!-- Status Banner -->
-  <div id="el-banner" style="display:none;" class="el-banner"></div>
-
-  <!-- Array Disk Distribution -->
-  <div class="el-card">
-    <div class="el-card-header">
-      <h3><i class="fa fa-database"></i> Array Disks Distribution</h3>
-      <div id="el-target-label" style="font-size:13px;color:var(--el-text-muted);">
-        Target: <b id="el-target-val" style="color:var(--el-text);">--%</b> (±<span id="el-tol-val">2</span>%)
-      </div>
-    </div>
-
-    <div style="overflow-x:auto;">
-      <table class="el-table">
-        <thead>
-          <tr>
-            <th style="width:120px;">Disk</th>
-            <th style="width:80px;">FS</th>
-            <th style="width:140px;">Status</th>
-            <th>Capacity & Usage</th>
-            <th style="width:70px;text-align:right;">%</th>
-            <th style="width:170px;text-align:right;">Used / Total</th>
-            <th style="width:130px;text-align:right;">Free Space</th>
-          </tr>
-        </thead>
-        <tbody id="el-disk-rows">
-          <tr><td colspan="7" style="text-align:center;color:var(--el-text-muted);padding:20px;">Loading array disks...</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- Zero-Duplication Shield Callout -->
-  <div class="el-shield-card" id="el-shield-box" style="display:none;">
-    <div class="el-shield-icon"><i class="fa fa-link"></i></div>
-    <div class="el-shield-content">
-      <h4><span id="shield-links-groups">0</span> Hardlink Groups Protected (<span id="shield-links-size">0 GB</span>)</h4>
-      <p>
-        EquiLink moves these files by replicating native hardlinks at the destination disk. 
-        Unlike unBALANCE or ReBalance, you save <b><span id="shield-saved-size">0 GB</span></b> of duplicated space and avoid breaking torrent seeds in qBittorrent.
-      </p>
-    </div>
-  </div>
-
-  <!-- Controls and Configuration -->
-  <div class="el-card">
-    <div class="el-card-header">
-      <h3><i class="fa fa-sliders"></i> Balancer Settings & Execution</h3>
-      <div style="font-size:12px;color:var(--el-accent);">
-        <i class="fa fa-check-circle"></i> Permissions preserved: nobody:users (99:100 775)
-      </div>
-    </div>
-
-    <div class="el-controls-row">
-      <div class="el-control-item">
-        <label for="el-tolerance">Tolerance:</label>
-        <select id="el-tolerance" class="el-select">
-          <option value="1">± 1% (Tightest)</option>
-          <option value="2" selected>± 2% (Recommended)</option>
-          <option value="3">± 3%</option>
-          <option value="5">± 5% (Relaxed)</option>
-          <option value="10">± 10%</option>
-        </select>
-      </div>
-
-      <div class="el-control-item">
-        <label for="el-min-size">Min File Size:</label>
-        <select id="el-min-size" class="el-select">
-          <option value="0">All files (0 MB)</option>
-          <option value="10240">10 MB</option>
-          <option value="102400" selected>100 MB (Media files)</option>
-          <option value="512000">500 MB (Large videos)</option>
-          <option value="1048576">1 GB</option>
-        </select>
-      </div>
-
-      <div class="el-control-item">
-        <label for="el-limit-gb">Batch Limit:</label>
-        <select id="el-limit-gb" class="el-select">
-          <option value="0" selected>Unlimited (Full Plan)</option>
-          <option value="25">25 GB (Small test)</option>
-          <option value="50">50 GB (Safe test batch)</option>
-          <option value="100">100 GB</option>
-          <option value="250">250 GB</option>
-          <option value="500">500 GB</option>
-        </select>
-      </div>
-    </div>
-
-    <!-- Quick Presets -->
-    <div class="el-presets-row">
-      <span>Presets:</span>
-      <button class="el-preset-btn" onclick="applyPreset(2, 102400, 0)">⚡ Fast Media Balance (&gt;100MB)</button>
-      <button class="el-preset-btn" onclick="applyPreset(2, 102400, 50)">🧪 Safe Test Batch (50 GB)</button>
-      <button class="el-preset-btn" onclick="applyPreset(2, 0, 0)">🌐 Deep Array Balance (All files)</button>
-    </div>
-
-    <!-- Action Buttons -->
-    <div class="el-actions-row">
-      <button id="btn-analyze" class="el-btn el-btn-analyze" onclick="startRun(true)">
-        <i class="fa fa-search"></i> Start Analysis (Dry Run)
-      </button>
-      <button id="btn-execute" class="el-btn el-btn-start" onclick="startRun(false)">
-        <i class="fa fa-play"></i> Balance Array (Execute)
-      </button>
-      <button id="btn-stop" class="el-btn el-btn-stop" onclick="stopRun()" disabled>
-        <i class="fa fa-stop"></i> Stop
-      </button>
-      <button id="btn-clear" class="el-btn el-btn-clear" onclick="clearResults()" style="display:none;">
-        <i class="fa fa-trash-o"></i> Clear Results
-      </button>
-
-      <span id="el-spinner" style="display:none;color:var(--el-accent);font-size:13px;">
-        <i class="fa fa-circle-o-notch fa-spin"></i> <span id="el-spinner-text">Processing...</span>
-      </span>
-    </div>
-  </div>
-
-  <!-- Statistics Panel -->
-  <div class="el-card" id="el-stats-card" style="display:none;">
-    <div class="el-card-header">
-      <h3><i class="fa fa-bar-chart"></i> Operation Statistics</h3>
-      <span id="el-op-badge" class="el-pill el-pill-bal">IDLE</span>
-    </div>
-
-    <!-- Overall Progress Bar -->
-    <div style="margin-bottom:14px;">
-      <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px;">
-        <span id="el-prog-label" style="font-weight:600;">Overall Transfer Progress</span>
-        <span id="el-prog-pct" style="font-weight:700;">0%</span>
-      </div>
-      <div class="el-bar-wrap" style="height:14px;">
-        <div id="el-prog-fill" class="el-bar-fill" style="width:0%;background:var(--el-accent);"></div>
-      </div>
-    </div>
-
-    <div class="el-stats-grid">
-      <div class="el-stat-box">
-        <div class="el-stat-title">File Groups Moved</div>
-        <div class="el-stat-val" id="st-groups-done">0</div>
-        <div class="el-stat-sub" id="st-groups-total">of 0 planned</div>
-      </div>
-
-      <div class="el-stat-box">
-        <div class="el-stat-title">Data Transferred</div>
-        <div class="el-stat-val" id="st-bytes-done">0 GB</div>
-        <div class="el-stat-sub" id="st-bytes-total">of 0 GB total</div>
-      </div>
-
-      <div class="el-stat-box" style="border:1px solid #10b981;background:rgba(16,185,129,0.06);">
-        <div class="el-stat-title" style="color:var(--el-accent);font-weight:600;">
-          <i class="fa fa-link"></i> Hardlinks Preserved
+  <div class="cols">
+    <section class="panel" aria-labelledby="h-run">
+      <div class="phead"><h2 id="h-run">Current run</h2><span class="pill p-off" id="hlb-run-pill">Idle</span></div>
+      <div class="pbody" id="hlb-runbox"></div>
+    </section>
+    <section class="panel" aria-labelledby="h-flow">
+      <div class="phead"><h2 id="h-flow">Plan by route</h2><span class="sub num" id="hlb-flow-tot"></span></div>
+      <div class="pbody">
+        <div class="flows" id="hlb-flows"></div>
+        <div id="hlb-comp" style="margin-top:16px" hidden>
+          <div class="eyebrow">Composition</div>
+          <div class="split" id="hlb-split"></div>
+          <div class="legend" style="margin-top:8px" id="hlb-split-l"></div>
         </div>
-        <div class="el-stat-val" id="st-links-groups" style="color:var(--el-accent);">0</div>
-        <div class="el-stat-sub" id="st-links-size">0 GB in multi-link files</div>
       </div>
-
-      <div class="el-stat-box">
-        <div class="el-stat-title">Transfer Speed</div>
-        <div class="el-stat-val" id="st-speed">-- MB/s</div>
-        <div class="el-stat-sub">Rsync stream</div>
-      </div>
-
-      <div class="el-stat-box">
-        <div class="el-stat-title">Elapsed Time</div>
-        <div class="el-stat-val" id="st-elapsed">00:00:00</div>
-        <div class="el-stat-sub" id="st-eta">ETA: --</div>
-      </div>
-
-      <div class="el-stat-box">
-        <div class="el-stat-title">Errors / Skipped</div>
-        <div class="el-stat-val" id="st-failed">0</div>
-        <div class="el-stat-sub">Zero broken files</div>
-      </div>
-    </div>
-
-    <div id="el-curr-file-wrap" style="margin-top:14px;font-size:12px;color:var(--el-text-muted);display:none;">
-      <b>Current File:</b> <span id="el-curr-file" style="font-family:monospace;color:var(--el-text);">--</span>
-    </div>
+    </section>
   </div>
 
-  <!-- Transfer Plan with Live Search & Filter -->
-  <div class="el-card" id="el-plan-card" style="display:none;">
-    <div class="el-card-header">
-      <h3>
-        <i class="fa fa-list-alt"></i> Transfer Plan 
-        <span id="el-plan-total-items" style="font-size:12px;color:var(--el-text-muted);font-weight:normal;"></span>
-      </h3>
-    </div>
-
-    <!-- Toolbar: Search input + Filter Chips -->
-    <div class="el-plan-toolbar">
-      <input type="text" id="el-plan-search" class="el-search-input" placeholder="🔍 Search file, movie, series or folder..." oninput="filterPlanTable()">
-      
-      <div class="el-filter-chips">
-        <span class="el-chip active" id="chip-all" onclick="setPlanFilter('all')">All (<span id="count-all">0</span>)</span>
-        <span class="el-chip" id="chip-links" onclick="setPlanFilter('links')"><i class="fa fa-link"></i> Hardlinks Only (<span id="count-links">0</span>)</span>
-        <span class="el-chip" id="chip-singles" onclick="setPlanFilter('singles')">Single Files (<span id="count-singles">0</span>)</span>
+  <div class="cols">
+    <section class="panel" aria-labelledby="h-guard">
+      <div class="phead"><h2 id="h-guard">Safety checks</h2><span class="sub">re-checked every 25 groups during a run</span></div>
+      <div class="pbody guards" id="hlb-guards"></div>
+    </section>
+    <section class="panel" aria-labelledby="h-skip">
+      <div class="phead"><h2 id="h-skip">Skipped folders</h2><span class="sub">left untouched this run</span></div>
+      <div class="pbody">
+        <div class="chips" id="hlb-skipped"></div>
+        <p class="note">A folder (season, movie) moves as a whole, and only when every link of every file in it was found on the same disk. Anything else stays where it is.</p>
       </div>
-    </div>
-
-    <div class="el-table-container">
-      <table class="el-table" id="el-plan-table">
-        <thead>
-          <tr>
-            <th style="width:130px;">Route</th>
-            <th>File Path</th>
-            <th style="width:110px;">Size</th>
-            <th style="width:140px;">Hardlink Status</th>
-          </tr>
-        </thead>
-        <tbody id="el-plan-rows"></tbody>
-      </table>
-    </div>
+    </section>
   </div>
 
-  <!-- Live Execution Console -->
-  <div class="el-card">
-    <div class="el-card-header">
-      <h3><i class="fa fa-terminal"></i> Activity Log</h3>
-      <div style="display:flex;gap:8px;">
-        <button class="el-btn el-btn-clear" style="padding:3px 10px;font-size:11.5px;" onclick="copyLog()">
-          <i class="fa fa-clipboard"></i> <span id="btn-copy-label">Copy Log</span>
-        </button>
-        <button class="el-btn el-btn-clear" style="padding:3px 10px;font-size:11.5px;" onclick="pollNow()">
-          <i class="fa fa-refresh"></i> Refresh
-        </button>
+  <section class="panel" aria-labelledby="h-plan">
+    <div class="phead">
+      <h2 id="h-plan">Moves <span class="sub" id="hlb-plan-count"></span></h2>
+      <div class="tools">
+        <input id="hlb-q" type="search" placeholder="Search path or disk" aria-label="Search path or disk">
+        <button class="chipbtn" type="button" data-f="all" aria-pressed="true">All</button>
+        <button class="chipbtn" type="button" data-f="links" aria-pressed="false">Hardlinked</button>
+        <button class="chipbtn" type="button" data-f="single" aria-pressed="false">Single</button>
       </div>
     </div>
-    <div class="el-console-wrap">
-      <div id="el-console" class="el-console">Waiting for activity...</div>
-    </div>
-  </div>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Status</th><th>Path</th><th>Disks</th><th class="r">Size</th><th class="r">Links</th></tr></thead>
+      <tbody id="hlb-rows"></tbody>
+    </table></div>
+  </section>
 
+  <section class="panel">
+    <details id="hlb-settings">
+      <summary class="phead"><h2><span class="caret">▸</span> Settings</h2><span class="sub" id="hlb-sched-sum"></span></summary>
+      <div class="pbody">
+        <div class="sgrid">
+          <div class="group">
+            <div class="eyebrow">Shares to balance</div>
+            <div class="checks" id="hlb-shares"></div>
+            <div class="field"><div class="hint">None ticked means every share except system, appdata, domains and isos.</div></div>
+          </div>
+          <div class="group">
+            <div class="eyebrow">Disks to leave alone</div>
+            <div class="checks" id="hlb-xdisks"></div>
+            <div class="field"><div class="hint">Excluded disks are never read from or written to and do not count toward the target fill.</div></div>
+          </div>
+          <div class="field"><label for="s-tol">Tolerance <span class="val" id="s-tol-v">±2 %</span></label><input id="s-tol" type="range" min="1" max="10" value="2"><div class="hint">How far a disk may sit from the target.</div></div>
+          <div class="field"><label for="s-min">Minimum size (MB)</label><input id="s-min" type="number" min="0" value="100"><div class="hint">Folders whose biggest file is smaller are ignored.</div></div>
+          <div class="field"><label for="s-lim">Limit per run (GB)</label><input id="s-lim" type="number" min="0" value="0"><div class="hint">0 moves everything in one run.</div></div>
+          <div class="field"><label for="s-age">Leave recent folders for</label><select id="s-age"><option value="15">15 minutes</option><option value="60">1 hour</option><option value="360">6 hours</option><option value="1440">1 day</option></select><div class="hint">Protects downloads that are still being imported.</div></div>
+          <div class="field"><label for="s-head">Keep free on destination (GB)</label><input id="s-head" type="number" min="1" value="10"></div>
+          <div class="field"><label for="s-sched">Automatic runs</label><select id="s-sched"><option value="off">Off</option><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly (day 1)</option></select></div>
+          <div class="field"><label for="s-hour">At</label><select id="s-hour"></select></div>
+          <div class="field"><label for="s-dow">On</label><select id="s-dow"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></select></div>
+          <div class="field"><label>Notifications</label><label class="check" for="s-notify"><input id="s-notify" type="checkbox" checked> Unraid notification when a run ends</label></div>
+          <div class="field" style="grid-column:span 3"><label for="s-hook">Webhook (optional)</label><input id="s-hook" type="url" placeholder="http://127.0.0.1:5678/webhook/alerts"><div class="hint">Alertmanager-style JSON, sent when a run ends with problems or moved data.</div></div>
+        </div>
+        <div class="sfoot">
+          <span class="sub" id="hlb-save-msg">Saved to /boot/config/plugins/hardlink-balance/hardlink-balance.cfg</span>
+          <button class="btn primary" type="button" id="hlb-save">Save settings</button>
+        </div>
+      </div>
+    </details>
+  </section>
+
+  <section class="panel" aria-labelledby="h-hist">
+    <div class="phead"><h2 id="h-hist">History</h2><span class="sub" id="hlb-runs-dir"></span></div>
+    <div class="pbody" id="hlb-hist"></div>
+  </section>
+
+  <section class="panel">
+    <details>
+      <summary class="phead"><h2><span class="caret">▸</span> Log</h2><button class="btn" type="button" id="hlb-copy">Copy log</button></summary>
+      <div class="pbody"><pre class="console" id="hlb-log">No log yet.</pre></div>
+    </details>
+  </section>
 </div>
 
 <script>
-const ENDPOINT   = '/plugins/hardlink-balance/scripts/status.php';
-const CSRF_TOKEN = '<?=$csrf?>';
-let pollTimer    = null;
-let lastState    = 'idle';
-let currentPlan  = [];
-let activeFilter = 'all';
+(function(){
+const ENDPOINT='/plugins/hardlink-balance/scripts/status.php';
+const CSRF=<?= json_encode($csrf) ?>;
+const $=id=>document.getElementById(id);
+let D=null, filter='all', settingsDirty=false, confirmTimer=null, rates=[];
 
-// Theme detection
-function checkTheme() {
-    const wrap = document.getElementById('el-wrap');
-    const isDark = document.body.classList.contains('dark') || 
-                   window.matchMedia('(prefers-color-scheme: dark)').matches ||
-                   document.documentElement.getAttribute('data-theme') === 'dark';
-    if (isDark) wrap.classList.add('el-dark');
-    else wrap.classList.remove('el-dark');
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function fmtKB(kb){kb=+kb||0;const u=['KB','MB','GB','TB'];let i=0;while(kb>=1024&&i<3){kb/=1024;i++}return (i>=2?kb.toFixed(2):Math.round(kb))+' '+u[i]}
+function fmtDur(s){s=Math.max(0,Math.round(s||0));const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?`${h} h ${String(m).padStart(2,'0')}`:m?`${m} min`:`${s} s`}
+const when=t=>t?new Date(t*1000).toLocaleString([], {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'–';
+const SKIP={partial:'partial download (.!qB, .part…)',recent:'changed too recently',open_write:'open for writing',links_outside:'a link lives outside the scanned shares'};
+
+function post(data){
+  const b=new FormData(); b.append('csrf_token',CSRF); for(const k in data) b.append(k,data[k]);
+  return fetch(ENDPOINT,{method:'POST',body:b}).then(r=>r.json());
 }
-checkTheme();
+function banner(type,msg){const b=$('hlb-banner'); if(!msg){b.hidden=true;return} b.className='banner '+type; b.textContent=msg; b.hidden=false}
 
-function fmtKB(kb) {
-    if (!kb || kb <= 0) return '0 KB';
-    if (kb >= 1024 * 1024 * 1024) return (kb / (1024*1024*1024)).toFixed(2) + ' TB';
-    if (kb >= 1024 * 1024) return (kb / (1024*1024)).toFixed(2) + ' GB';
-    if (kb >= 1024) return (kb / 1024).toFixed(1) + ' MB';
-    return kb + ' KB';
+/* ---------- render ---------- */
+function roleOf(d,target,tol){ if(d.excluded) return 'off'; return d.pct>target+tol?'src':d.pct<target-tol?'dst':'ok' }
+
+function renderDisks(){
+  const disks=D.live_disks||[], target=D.live_target_pct, tol=+D.tolerance||2;
+  if(!disks.length){$('hlb-disks').innerHTML='<div class="empty">No array disks are mounted. Start the array to see them.</div>';return}
+  // Projected fill after the plan: snapshot the plan was made from + flows
+  const delta={}; (D.flows||[]).forEach(f=>{delta[f.src]=(delta[f.src]||0)-f.size_kb; delta[f.dst]=(delta[f.dst]||0)+f.size_kb});
+  const base={}; (D.disks||[]).forEach(d=>base[d.name]=d);
+  const showPlan=['planned','running','planning'].includes(D.state) && D.flows;
+  const pcts=disks.map(d=>d.pct); const lo=Math.max(0,Math.floor((Math.min(...pcts,target-tol)-8)/10)*10), hi=Math.min(100,Math.ceil((Math.max(...pcts,target+tol)+6)/10)*10);
+  const X=p=>Math.max(0,Math.min(100,(p-lo)/(hi-lo)*100));
+  let html='';
+  for(const d of disks){
+    const r=roleOf(d,target,tol);
+    const lbl={src:['p-src','Source'],dst:['p-dst','Destination'],ok:['p-ok','In band'],off:['p-off','Excluded']}[r];
+    const color={src:'var(--src)',dst:'var(--dst)',ok:'var(--ok)',off:'var(--off)'}[r];
+    let after=null;
+    if(showPlan && delta[d.name] && base[d.name]) after=(base[d.name].used_kb+delta[d.name])*100/base[d.name].size_kb;
+    html+=`<div class="disk ${r==='off'?'excluded':''}">
+      <div class="dname"><b>${esc(d.name)} <span class="pill ${lbl[0]}">${lbl[1]}</span></b><span>${esc(d.fsType)} · ${fmtKB(d.size_kb)}${d.temp?' · '+esc(d.temp):''}${d.spun_down?' · spun down':''}</span></div>
+      <div class="bar" role="img" aria-label="${esc(d.name)} ${d.pct} percent full, target ${target}">
+        <div class="band" style="left:${X(target-tol)}%;width:${X(target+tol)-X(target-tol)}%"></div>
+        <div class="fill" style="width:${X(d.pct)}%;background:${color}"></div>
+        ${after!==null?`<div class="ghost" style="width:${X(after)}%"></div>`:''}
+        <div class="target" style="left:calc(${X(target)}% - 1px)"></div>
+      </div>
+      <div class="dstat"><b>${d.pct} %</b>${after!==null?` → ${Math.round(after)} %`:''}<br><span style="color:var(--muted)">${fmtKB(d.free_kb)} free</span></div>
+    </div>`;
+  }
+  const ticks=[]; for(let v=lo; v<=hi; v+=(hi-lo>40?20:10)) ticks.push(v);
+  html+=`<div class="axis"><div></div><div>${ticks.map(v=>`<span style="left:${X(v)}%">${v}%</span>`).join('')}</div><div></div></div>`;
+  $('hlb-disks').innerHTML=html;
+
+  const act=disks.filter(d=>!d.excluded);
+  if(act.length){
+    const a=act.reduce((m,d)=>d.pct>m.pct?d:m), b=act.reduce((m,d)=>d.pct<m.pct?d:m);
+    $('k-spread').innerHTML=`${a.pct-b.pct}<small>pts</small>`; $('k-spread-d').textContent=`${a.name} ${a.pct} % · ${b.name} ${b.pct} %`;
+    const s=act.filter(d=>roleOf(d,target,tol)==='src').length, t=act.filter(d=>roleOf(d,target,tol)==='dst').length;
+    $('k-out').innerHTML=`${s+t}<small>/ ${act.length}</small>`; $('k-out-d').textContent=`${s} source · ${t} destination`;
+  }
+  $('k-target').innerHTML=`${target}<small>%</small>`; $('k-tol').textContent=tol;
 }
 
-function fmtSec(s) {
-    if (!s || s <= 0) return '00:00:00';
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = Math.floor(s % 60);
-    return [h, m, sec].map(v => v < 10 ? '0' + v : v).join(':');
+function renderSummary(){
+  const st=D.state, s=D.stats||{};
+  const T={idle:'Idle',starting:'Starting',planning:'Planning',planned:'Plan ready',running:'Moving',completed:'Finished',stopped:'Stopped',error:'Error'};
+  $('hlb-state').dataset.s=st; $('hlb-state-t').textContent=T[st]||st;
+  let d='Ready. Simulate first to see what would move.';
+  if(st==='planning') d=`Scanning ${D.current_disk||''} (${D.source_idx||1} of ${D.source_total||1} source disks)`;
+  if(st==='planned') d=D.dry_run?'Simulation finished · nothing was moved':'Plan ready';
+  if(st==='running') d=`Started ${when(D.started_at)} · ${fmtDur(D.elapsed_sec)} elapsed`;
+  if(st==='completed') d=D.plan_count?`${fmtKB(s.bytes_done_kb)} moved · ${s.files_skipped||0} skipped`:(D.note||'Every disk is inside the band');
+  if(st==='stopped') d=`Stopped after ${fmtKB(s.bytes_done_kb||0)} · sources untouched`;
+  if(st==='error') d=D.msg||'The engine reported an error';
+  $('hlb-state-d').textContent=d;
+  const planned=s.bytes_total_kb||0;
+  $('k-plan').innerHTML=planned?`${fmtKB(planned).replace(/ (\w+)$/,'<small>$1</small>')}`:'–';
+  $('k-plan-d').textContent=planned?`${(D.plan_count||0).toLocaleString()} groups · ${fmtKB(s.multi_linked_kb||0)} hardlinked`:'run Simulate to plan';
+  const busy=D.running;
+  $('hlb-run').hidden=busy; $('hlb-plan').hidden=busy; $('hlb-stop').hidden=!busy;
+  $('hlb-clear').hidden=busy||!['completed','stopped','planned','error'].includes(st);
+  const g=D.guards||{}, block=g.parity||g.mover||g.rsync;
+  $('hlb-run').disabled=!!block;
+  if(block && !busy) banner('warn',`Run is paused: ${block}. Simulate still works.`);
+  else if(st==='error') banner('err',D.msg||'Error');
+  else if(st==='completed' && (s.files_skipped||0)>0) banner('warn',`${s.files_skipped} groups were skipped. The log says why; nothing was lost.`);
+  else banner('',null);
 }
 
-function renderDisks(disks, targetPct, tol) {
-    const tbody = document.getElementById('el-disk-rows');
-    if (!disks || disks.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;">No disks found</td></tr>';
-        return;
+function renderRun(){
+  const st=D.state, s=D.stats||{}, el=$('hlb-runbox'), pill=$('hlb-run-pill');
+  const set=(c,t)=>{pill.className='pill '+c; pill.textContent=t};
+  if(st==='running'){
+    const cur=D.current||{}; if(cur.rate_mbs) rates.push(cur.rate_mbs); rates=rates.slice(-30);
+    set('p-warn','Moving');
+    const rate=(s.rate_kbs||0)/1024, p=s.pct_done||0;
+    const max=Math.max(...rates,1), pts=rates.map((v,i)=>`${(rates.length>1?i/(rates.length-1)*300:300).toFixed(1)},${(50-v/max*42).toFixed(1)}`).join(' ');
+    const last=(pts.split(' ').pop()||'300,50').split(',');
+    el.innerHTML=`<div class="big"><span class="kv num">${fmtKB(s.bytes_done_kb)}</span><span class="sub">of ${fmtKB(s.bytes_total_kb)} · ${Math.round(p)} %</span></div>
+      <div class="prog" role="progressbar" aria-valuenow="${Math.round(p)}" aria-valuemin="0" aria-valuemax="100"><i style="width:${p}%"></i></div>
+      <div class="sub num">Group ${(s.files_done||0)+(s.files_skipped||0)} of ${s.files_total||0} · ${s.files_skipped||0} skipped</div>
+      <div class="minis">
+        <div class="mini"><div class="eyebrow">Speed</div><div class="kv num">${Math.round(rate)}<small>MB/s</small></div></div>
+        <div class="mini"><div class="eyebrow">Time left</div><div class="kv num">${s.eta_sec?fmtDur(s.eta_sec):'–'}</div></div>
+        <div class="mini"><div class="eyebrow">Hardlinked groups</div><div class="kv num">${s.multi_linked_groups||0}</div></div>
+      </div>
+      ${rates.length>1?`<svg class="spark" viewBox="0 0 300 56" preserveAspectRatio="none" aria-label="Copy speed of recent groups"><line x1="0" y1="50" x2="300" y2="50" stroke="var(--line)"/><polygon points="0,50 ${pts} 300,50" fill="var(--band)"/><polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.6" vector-effect="non-scaling-stroke"/><circle cx="${last[0]}" cy="${last[1]}" r="3" fill="var(--accent)"/></svg>`:''}
+      ${cur.rel_path?`<div class="current"><span class="eyebrow">Copying now · ${esc(cur.src_disk)} → ${esc(cur.dst_disk)}${cur.n_paths>1?` · ${cur.n_paths} links`:''}</span>${esc(cur.rel_path)}</div>`:''}`;
+    return;
+  }
+  rates=[];
+  if(st==='planning'||st==='starting'){ set('p-warn','Planning'); el.innerHTML=`<div class="big"><span class="kv">Scanning…</span></div><p class="sub">Reading ${esc(D.current_disk||'the source disks')} and grouping files by inode. Large disks take a few seconds each.</p>`; return }
+  if(st==='planned'){
+    set('p-warn',D.dry_run?'Simulation':'Planned');
+    const lim=+D.settings.LIMIT_GB||0, runs=lim?Math.ceil((s.bytes_total_kb||0)/1048576/lim):1;
+    el.innerHTML=`<div class="big"><span class="kv num">${fmtKB(s.bytes_total_kb)}</span><span class="sub">in ${(D.plan_count||0).toLocaleString()} groups</span></div>
+      <p class="sub">Nothing has moved yet. Press Run to apply this plan; every group is re-checked right before it moves.</p>
+      <div class="minis"><div class="mini"><div class="eyebrow">Runs needed</div><div class="kv num">${runs}</div></div>
+      <div class="mini"><div class="eyebrow">Hardlinked</div><div class="kv num">${s.bytes_total_kb?Math.round((s.multi_linked_kb||0)*100/s.bytes_total_kb):0} %</div></div>
+      <div class="mini"><div class="eyebrow">Routes</div><div class="kv num">${(D.flows||[]).length}</div></div></div>`;
+    return;
+  }
+  if(st==='completed'||st==='stopped'){
+    set(st==='completed'?'p-ok':'p-warn',st==='completed'?'Finished':'Stopped');
+    el.innerHTML=`<div class="big"><span class="kv num">${fmtKB(s.bytes_done_kb||0)}</span><span class="sub">moved in ${fmtDur(D.elapsed_sec)}</span></div>
+      <div class="minis"><div class="mini"><div class="eyebrow">Groups moved</div><div class="kv num">${s.files_done||0}</div></div>
+      <div class="mini"><div class="eyebrow">Skipped</div><div class="kv num">${s.files_skipped||0}</div></div>
+      <div class="mini"><div class="eyebrow">Avg speed</div><div class="kv num">${Math.round((s.rate_kbs||0)/1024)}<small>MB/s</small></div></div></div>`;
+    return;
+  }
+  set('p-off','Idle');
+  const h=(D.history||[])[0], sc=D.settings.SCHEDULE;
+  el.innerHTML=`<div class="big"><span class="kv">No run in progress</span></div>
+    <p class="sub">${sc&&sc!=='off'?`Automatic runs: ${schedText(D.settings)}.`:'Automatic runs are off. You can turn them on in Settings.'}</p>
+    ${h?`<div class="minis"><div class="mini"><div class="eyebrow">Last run</div><div class="kv num">${when(h.started_at).split(',')[0]}</div></div><div class="mini"><div class="eyebrow">Moved</div><div class="kv num">${fmtKB(h.moved_kb)}</div></div><div class="mini"><div class="eyebrow">Problems</div><div class="kv num">${h.partial||0}</div></div></div>`:''}`;
+}
+
+function renderFlows(){
+  const f=D.flows||[], s=D.stats||{};
+  if(!f.length){$('hlb-flows').innerHTML='<div class="empty">No plan yet. Simulate shows which disk sends data where.</div>';$('hlb-flow-tot').textContent='';$('hlb-comp').hidden=true;return}
+  const max=Math.max(...f.map(x=>x.size_kb)), shown=f.slice(0,8);
+  $('hlb-flows').innerHTML=shown.map(x=>`<div class="flow"><span class="from">${esc(x.src)}</span><div class="ftrack"><i style="width:${x.size_kb/max*100}%"></i></div><span class="to">${esc(x.dst)}</span><span class="num">${fmtKB(x.size_kb)}</span></div>`).join('')
+    +(f.length>8?`<div class="sub">and ${f.length-8} smaller routes</div>`:'');
+  $('hlb-flow-tot').textContent=`${f.length} routes · ${fmtKB(f.reduce((a,x)=>a+x.size_kb,0))}`;
+  const tot=s.bytes_total_kb||1, ml=s.multi_linked_kb||0, pc=ml*100/tot;
+  $('hlb-comp').hidden=false;
+  $('hlb-split').innerHTML=`<i style="width:${pc}%;background:var(--accent)"></i><i style="width:${100-pc}%;background:var(--muted);opacity:.45"></i>`;
+  $('hlb-split-l').innerHTML=`<span><i style="background:var(--accent)"></i>Hardlinked · ${fmtKB(ml)} · ${s.multi_linked_groups||0} groups</span><span><i style="background:var(--muted)"></i>Single files · ${fmtKB(tot-ml)} · ${(s.files_total||0)-(s.multi_linked_groups||0)} groups</span>`;
+}
+
+function renderGuards(){
+  const g=D.guards||{}, cfg=D.settings, shares=(cfg.SHARES||'').split(',').filter(Boolean), xd=(cfg.EXCLUDE_DISKS||'').split(',').filter(Boolean);
+  const row=(ok,t,d)=>`<div class="guard ${ok?'g-ok':'g-warn'}"><span class="ic">${ok?'✓':'!'}</span><div><b>${esc(t)}</b><span>${esc(d)}</span></div></div>`;
+  $('hlb-guards').innerHTML=
+    row(!g.mover,g.mover?'Mover is running':'Mover idle',g.mover?'runs wait until it finishes':'checked before and during runs')+
+    row(!g.parity,g.parity?'Parity check running':'No parity operation',g.parity?'runs wait until it finishes':'parity check or rebuild')+
+    row(!g.rsync,g.rsync?'Another copy is running':'No other array copy',g.rsync||'unBALANCE or any rsync between /mnt/disk*')+
+    row(true,'Open files are skipped','anything open for writing (downloads, imports) stays put')+
+    row(true,'Copy is on disk before delete','each copy and its folder are flushed (fsync) first')+
+    row(true,shares.length?`Only ${shares.length} share${shares.length>1?'s':''}`:'All user shares',(shares.length?shares.join(', '):'system shares excluded')+(xd.length?` · leaving ${xd.join(', ')} alone`:''));
+}
+
+function renderSkipped(){
+  const sk=D.skipped||{}, keys=Object.keys(SKIP);
+  if(!D.flows && !Object.keys(sk).length){$('hlb-skipped').innerHTML='<div class="empty">Shown after a simulation or run.</div>';return}
+  $('hlb-skipped').innerHTML=keys.map(k=>`<span class="chip"><b>${sk[k]||0}</b>${SKIP[k]}</span>`).join('');
+}
+
+function renderRows(){
+  const plan=D.plan||[], q=$('hlb-q').value.toLowerCase().trim();
+  $('hlb-plan-count').textContent=D.plan_count?`· showing ${Math.min(plan.length,D.plan_count)} of ${D.plan_count.toLocaleString()}`:'';
+  const done=(D.stats?.files_done||0)+(D.stats?.files_skipped||0), recent={}; (D.recent||[]).forEach(r=>recent[r.index]=r.status);
+  const st=D.state;
+  const rows=plan.map((p,i)=>({p,i})).filter(({p})=>(filter==='all'||(filter==='links'?p.links>1:p.links<=1))&&(!q||(p.path+' '+p.src_disk+' '+p.dst_disk).toLowerCase().includes(q))).slice(0,300);
+  if(!rows.length){$('hlb-rows').innerHTML=`<tr><td colspan="5" class="sub" style="text-align:center;padding:18px">${plan.length?'No moves match the filter':'No moves planned'}</td></tr>`;return}
+  $('hlb-rows').innerHTML=rows.map(({p,i})=>{
+    let s=['st-wait',st==='planned'?'Planned':'Queued'];
+    if(st==='running'||st==='completed'||st==='stopped'){
+      const r=recent[i];
+      if(r==='ok'||(r===undefined&&i<done)) s=['st-done','Moved'];
+      if(r==='skipped') s=['st-skip','Skipped']; if(r==='partial') s=['st-skip','On both disks'];
+      if(st==='running'&&i===done) s=['st-run','Copying'];
     }
-    document.getElementById('el-target-val').textContent = targetPct + '%';
-    document.getElementById('el-tol-val').textContent = tol;
-    document.getElementById('el-disks-count').textContent = disks.length + ' Disks';
-
-    let html = '';
-    for (const d of disks) {
-        let badgeClass = 'el-pill-bal';
-        let badgeText  = 'BALANCED';
-        let barColor   = '#0284c7';
-        let deltaText  = '';
-
-        if (d.role === 'source') {
-            badgeClass = 'el-pill-source';
-            badgeText  = 'SOURCE';
-            barColor   = '#ef4444';
-            if (d.delta_kb > 0) deltaText = `<span style="font-size:11px;color:#ef4444;margin-left:4px;">(↓ ${fmtKB(d.delta_kb)})</span>`;
-        } else if (d.role === 'destination') {
-            badgeClass = 'el-pill-dest';
-            badgeText  = 'DEST';
-            barColor   = '#10b981';
-            if (d.delta_kb < 0) deltaText = `<span style="font-size:11px;color:#10b981;margin-left:4px;">(↑ ${fmtKB(Math.abs(d.delta_kb))})</span>`;
-        }
-
-        const fsBadge = d.fsType ? `<span class="el-pill el-pill-fs">${d.fsType}</span>` : '';
-
-        html += `<tr>
-            <td><b>${d.name}</b></td>
-            <td>${fsBadge}</td>
-            <td><span class="el-pill ${badgeClass}">${badgeText}</span> ${deltaText}</td>
-            <td>
-                <div class="el-bar-wrap">
-                    <div class="el-bar-fill" style="width:${Math.min(100, d.pct)}%;background:${barColor};"></div>
-                    <div class="el-bar-target-line" style="left:${targetPct}%;" title="Target: ${targetPct}%"></div>
-                </div>
-            </td>
-            <td style="text-align:right;font-weight:700;">${d.pct}%</td>
-            <td style="text-align:right;font-size:12px;">${fmtKB(d.used_kb)} / ${fmtKB(d.size_kb)}</td>
-            <td style="text-align:right;font-size:12px;color:var(--el-text-muted);">${fmtKB(d.free_kb)}</td>
-        </tr>`;
-    }
-    tbody.innerHTML = html;
+    return `<tr><td class="${s[0]}" style="white-space:nowrap;font-weight:600">${s[1]}</td><td class="path">${esc(p.path)}</td><td class="mono" style="white-space:nowrap">${esc(p.src_disk)} → ${esc(p.dst_disk)}</td><td class="r num">${fmtKB(p.size_kb)}</td><td class="r">${p.links>1?`<span class="pill p-dst">${p.links} links</span>`:'<span class="pill p-ok">single</span>'}</td></tr>`}).join('');
 }
 
-function setPlanFilter(filter) {
-    activeFilter = filter;
-    document.querySelectorAll('.el-chip').forEach(c => c.classList.remove('active'));
-    document.getElementById('chip-' + filter).classList.add('active');
-    filterPlanTable();
+const DOW=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+function schedText(c){const h=String(c.SCHEDULE_HOUR).padStart(2,'0')+':00';return {daily:`every day at ${h}`,weekly:`every ${DOW[+c.SCHEDULE_DOW]} at ${h}`,monthly:`day 1 of each month at ${h}`}[c.SCHEDULE]||'off'}
+
+function renderSettings(){
+  const c=D.settings; $('hlb-sched-sum').textContent=c.SCHEDULE==='off'?'manual runs only':'automatic: '+schedText(c);
+  if(settingsDirty) return;
+  const sh=(c.SHARES||'').split(',').filter(Boolean), xd=(c.EXCLUDE_DISKS||'').split(',').filter(Boolean);
+  $('hlb-shares').innerHTML=(D.shares||[]).map(s=>`<label class="check ${s.system?'sys':''}"><input type="checkbox" data-share="${esc(s.name)}" ${sh.includes(s.name)?'checked':''}> ${esc(s.name)}${s.system?' <span class="sub">system</span>':''}</label>`).join('')||'<span class="sub">No user shares found.</span>';
+  $('hlb-xdisks').innerHTML=(D.live_disks||[]).map(d=>`<label class="check"><input type="checkbox" data-disk="${esc(d.name)}" ${xd.includes(d.name)?'checked':''}> ${esc(d.name)} <span class="sub">${esc(d.fsType)}</span></label>`).join('');
+  $('s-tol').value=c.TOLERANCE; $('s-tol-v').textContent=`±${c.TOLERANCE} %`; $('s-min').value=c.MIN_SIZE_MB; $('s-lim').value=c.LIMIT_GB;
+  const age=$('s-age'); if(![...age.options].some(o=>o.value===String(c.MIN_AGE_MIN))) age.add(new Option(`${c.MIN_AGE_MIN} minutes`,c.MIN_AGE_MIN)); age.value=String(c.MIN_AGE_MIN);
+  $('s-head').value=c.HEADROOM_GB; $('s-sched').value=c.SCHEDULE; $('s-hour').value=c.SCHEDULE_HOUR; $('s-dow').value=c.SCHEDULE_DOW;
+  $('s-notify').checked=(c.UNRAID_NOTIFY||'yes')==='yes'; $('s-hook').value=c.WEBHOOK||'';
+  schedFields(); $('hlb-runs-dir').textContent='reports in '+c.RUNS_DIR;
+}
+function schedFields(){const v=$('s-sched').value; $('s-hour').disabled=v==='off'; $('s-dow').disabled=v!=='weekly'}
+
+function renderHistory(){
+  const h=D.history||[];
+  if(!h.length){$('hlb-hist').innerHTML='<div class="empty">No runs yet. Each run that moves data saves a report here.</div>';return}
+  $('hlb-hist').innerHTML=h.map(r=>{
+    if(r.state==='done') r.state='completed';
+    const pill=r.state==='completed'?(r.partial?['p-warn','check log']:['p-ok','completed']):['p-warn',esc(r.state)];
+    return `<div class="hrow"><b class="mono">${when(r.started_at)}</b><span>${r.trigger==='scheduled'?'Automatic':r.trigger==='manual'?'Manual':esc(r.trigger)}${r.tolerance?` · ±${r.tolerance} %`:''} · ${fmtDur(r.elapsed_s)}</span><span class="num">${fmtKB(r.moved_kb)}</span><span class="num">${r.out_after!==null&&r.out_after!==undefined?r.out_after+' out of band':r.failed+' skipped'}</span><span class="pill ${pill[0]}" style="justify-self:end">${pill[1]}</span></div>`}).join('');
 }
 
-function filterPlanTable() {
-    const q = (document.getElementById('el-plan-search').value || '').toLowerCase().trim();
-    const tbody = document.getElementById('el-plan-rows');
-
-    let visible = 0;
-    let html = '';
-
-    for (const p of currentPlan) {
-        // Chip filter
-        if (activeFilter === 'links' && p.links <= 1) continue;
-        if (activeFilter === 'singles' && p.links > 1) continue;
-
-        // Search query filter
-        if (q && !p.path.toLowerCase().includes(q) && !p.src_disk.toLowerCase().includes(q) && !p.dst_disk.toLowerCase().includes(q)) {
-            continue;
-        }
-
-        visible++;
-        const linkBadge = p.links > 1
-            ? `<span class="el-pill el-pill-dest"><i class="fa fa-link"></i> ${p.links} links</span>`
-            : `<span class="el-pill el-pill-bal">1 file</span>`;
-
-        html += `<tr>
-            <td><b>${p.src_disk}</b> <i class="fa fa-arrow-right" style="color:var(--el-text-muted);font-size:10px;"></i> <b>${p.dst_disk}</b></td>
-            <td style="word-break:break-all;font-family:monospace;font-size:12px;">${escHtml(p.path)}</td>
-            <td>${fmtKB(p.size_kb)}</td>
-            <td>${linkBadge}</td>
-        </tr>`;
-    }
-
-    if (visible === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--el-text-muted);padding:16px;">No planned moves match filter</td></tr>';
-    } else {
-        tbody.innerHTML = html;
-    }
+function render(){
+  renderSummary(); renderDisks(); renderRun(); renderFlows(); renderGuards(); renderSkipped(); renderRows(); renderSettings(); renderHistory();
+  const log=D.log||[]; if(log.length){const el=$('hlb-log'); const atEnd=el.scrollTop+el.clientHeight>=el.scrollHeight-20; el.textContent=log.join('\n'); if(atEnd) el.scrollTop=el.scrollHeight}
 }
 
-function renderPlan(plan, totalCount) {
-    currentPlan = plan || [];
-    const card = document.getElementById('el-plan-card');
-    const label = document.getElementById('el-plan-total-items');
-
-    if (!plan || plan.length === 0) {
-        card.style.display = 'none';
-        return;
-    }
-    card.style.display = 'block';
-    label.textContent = `(Showing top ${plan.length} of ${totalCount || plan.length} planned moves)`;
-
-    // Update chip counters
-    const linksCount = plan.filter(p => p.links > 1).length;
-    document.getElementById('count-all').textContent = plan.length;
-    document.getElementById('count-links').textContent = linksCount;
-    document.getElementById('count-singles').textContent = (plan.length - linksCount);
-
-    filterPlanTable();
+/* ---------- polling ---------- */
+let timer=null;
+function poll(){
+  fetch(ENDPOINT+'?_='+Date.now()).then(r=>r.json()).then(d=>{D=d; render()}).catch(()=>banner('err','Lost contact with the server. Retrying…'))
+    .finally(()=>{clearTimeout(timer); timer=setTimeout(poll,(D&&D.running)?2000:8000)});
 }
 
-function renderLog(lines) {
-    const box = document.getElementById('el-console');
-    if (!lines || lines.length === 0) return;
-    box.textContent = lines.join('\n');
-    box.scrollTop = box.scrollHeight;
+/* ---------- actions ---------- */
+function start(dry){
+  post({action:'start',dry_run:dry?1:''}).then(r=>{ if(!r.success) banner('err',r.msg||'Could not start'); poll() });
 }
-
-function copyLog() {
-    const box = document.getElementById('el-console');
-    navigator.clipboard.writeText(box.textContent).then(() => {
-        const lbl = document.getElementById('btn-copy-label');
-        lbl.textContent = 'Copied!';
-        setTimeout(() => lbl.textContent = 'Copy Log', 1800);
-    });
-}
-
-function showBanner(type, html) {
-    const b = document.getElementById('el-banner');
-    b.className = 'el-banner el-banner-' + type;
-    b.innerHTML = html;
-    b.style.display = 'flex';
-}
-function hideBanner() { document.getElementById('el-banner').style.display = 'none'; }
-
-function escHtml(s) {
-    if (!s) return '';
-    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-function applyPreset(tol, minSize, limitGb) {
-    document.getElementById('el-tolerance').value = tol;
-    document.getElementById('el-min-size').value = minSize;
-    document.getElementById('el-limit-gb').value = limitGb;
-    pollNow();
-}
-
-function setButtons(state) {
-    const btnAn = document.getElementById('btn-analyze');
-    const btnEx = document.getElementById('btn-execute');
-    const btnSt = document.getElementById('btn-stop');
-    const btnCl = document.getElementById('btn-clear');
-    const spin  = document.getElementById('el-spinner');
-    const spinT = document.getElementById('el-spinner-text');
-
-    const running = (state === 'running' || state === 'starting' || state === 'planning');
-
-    btnAn.disabled = running;
-    btnEx.disabled = running;
-    btnSt.disabled = !running;
-    btnCl.style.display = (!running && state !== 'idle') ? 'inline-flex' : 'none';
-
-    if (running) {
-        spin.style.display = 'inline-block';
-        spinT.textContent = state === 'planning' ? 'Analyzing array & grouping hardlinks...' : 'Balancing data in background...';
-    } else {
-        spin.style.display = 'none';
-    }
-}
-
-function applyStatus(data) {
-    const state = data.state || 'idle';
-    lastState = state;
-    setButtons(state);
-
-    const tol = data.tolerance || parseInt(document.getElementById('el-tolerance').value);
-    const targetPct = data.target_pct || 0;
-    renderDisks(data.disks, targetPct, tol);
-    renderLog(data.log);
-
-    const statsCard  = document.getElementById('el-stats-card');
-    const shieldBox  = document.getElementById('el-shield-box');
-    const stats      = data.stats || {};
-
-    if (state !== 'idle') {
-        statsCard.style.display = 'block';
-        const badge = document.getElementById('el-op-badge');
-        badge.textContent = state.toUpperCase();
-        badge.className = 'el-pill ' + (state === 'running' ? 'el-pill-source' : (state === 'completed' ? 'el-pill-dest' : 'el-pill-bal'));
-
-        const totalKB = stats.bytes_total_kb || 0;
-        const doneKB  = stats.bytes_done_kb  || 0;
-        const pct = totalKB > 0 ? ((doneKB * 100) / totalKB).toFixed(1) : (state === 'completed' ? 100 : 0);
-
-        document.getElementById('el-prog-pct').textContent = pct + '%';
-        document.getElementById('el-prog-fill').style.width = pct + '%';
-
-        document.getElementById('st-groups-done').textContent = stats.files_done || 0;
-        document.getElementById('st-groups-total').textContent = `of ${stats.files_total || data.plan_count || 0} planned`;
-
-        document.getElementById('st-bytes-done').textContent = fmtKB(doneKB);
-        document.getElementById('st-bytes-total').textContent = `of ${fmtKB(totalKB)} total`;
-
-        const multiGroups = stats.multi_linked_groups || 0;
-        const multiKB     = stats.multi_linked_kb || 0;
-        document.getElementById('st-links-groups').textContent = multiGroups;
-        document.getElementById('st-links-size').textContent = `${fmtKB(multiKB)} preserved`;
-
-        if (multiGroups > 0) {
-            shieldBox.style.display = 'flex';
-            document.getElementById('shield-links-groups').textContent = multiGroups;
-            document.getElementById('shield-links-size').textContent   = fmtKB(multiKB);
-            document.getElementById('shield-saved-size').textContent   = fmtKB(multiKB);
-        } else {
-            shieldBox.style.display = 'none';
-        }
-
-        const speedKbs = stats.rate_kbs || 0;
-        document.getElementById('st-speed').textContent = speedKbs > 0 ? (speedKbs / 1024).toFixed(1) + ' MB/s' : '-- MB/s';
-
-        document.getElementById('st-elapsed').textContent = fmtSec(data.elapsed_sec || 0);
-        document.getElementById('st-eta').textContent = stats.eta_sec > 0 ? 'ETA: ' + fmtSec(stats.eta_sec) : (state === 'completed' ? 'Done' : 'ETA: --');
-
-        document.getElementById('st-failed').textContent = stats.files_skipped || 0;
-
-        const currWrap = document.getElementById('el-curr-file-wrap');
-        const currFile = document.getElementById('el-curr-file');
-        if (data.current_file) {
-            currWrap.style.display = 'block';
-            currFile.textContent = data.current_file;
-        } else {
-            currWrap.style.display = 'none';
-        }
-
-        renderPlan(data.plan, data.plan_count);
-
-        if (state === 'planned') {
-            showBanner('info', `<i class="fa fa-info-circle"></i> <b>Analysis Complete:</b> Found ${data.plan_count} groups (${fmtKB(totalKB)}). ${multiGroups} groups share hardlinks and will be replicated safely without duplication.`);
-        } else if (state === 'completed') {
-            showBanner('success', `<i class="fa fa-check-circle"></i> <b>Operation Completed:</b> Transferred ${fmtKB(doneKB)} across ${stats.files_done} groups with complete hardlink integrity.`);
-        } else if (state === 'stopped') {
-            showBanner('warn', `<i class="fa fa-exclamation-triangle"></i> <b>Stopped by User:</b> Balancing halted cleanly after current file group. No broken links.`);
-        } else if (state === 'error') {
-            showBanner('err', `<i class="fa fa-times-circle"></i> <b>Error:</b> ${escHtml(data.msg || 'An error occurred during execution')}`);
-        } else {
-            hideBanner();
-        }
-    } else {
-        statsCard.style.display = 'none';
-        shieldBox.style.display = 'none';
-        document.getElementById('el-plan-card').style.display = 'none';
-        hideBanner();
-    }
-}
-
-function pollNow() {
-    const tol = document.getElementById('el-tolerance').value;
-    fetch(ENDPOINT + '?tolerance=' + tol)
-        .then(r => r.json())
-        .then(data => {
-            applyStatus(data);
-            const running = (data.state === 'running' || data.state === 'starting' || data.state === 'planning');
-            if (running) {
-                if (!pollTimer) pollTimer = setTimeout(pollNow, 1200);
-            } else {
-                if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-            }
-        })
-        .catch(err => console.error('Poll error:', err));
-}
-
-function startRun(isDryRun) {
-    const tol = document.getElementById('el-tolerance').value;
-    const minSize = document.getElementById('el-min-size').value;
-    const limitGb = document.getElementById('el-limit-gb').value;
-
-    const body = new URLSearchParams();
-    body.append('csrf_token', CSRF_TOKEN);
-    body.append('action', 'start');
-    body.append('tolerance', tol);
-    body.append('dry_run', isDryRun ? '1' : '');
-    body.append('min_file_kb', minSize);
-    body.append('limit_gb', limitGb);
-
-    setButtons(isDryRun ? 'planning' : 'starting');
-
-    fetch(ENDPOINT, { method: 'POST', body: body })
-        .then(r => r.json())
-        .then(res => {
-            if (!res.success) {
-                alert('Could not start: ' + (res.msg || 'Unknown error'));
-            }
-            pollNow();
-        })
-        .catch(err => {
-            alert('Request error: ' + err);
-            pollNow();
-        });
-}
-
-function stopRun() {
-    if (!confirm('Are you sure you want to stop balancing? The file group currently in flight will finish cleanly before halting.')) return;
-    const body = new URLSearchParams();
-    body.append('csrf_token', CSRF_TOKEN);
-    body.append('action', 'stop');
-
-    fetch(ENDPOINT, { method: 'POST', body: body })
-        .then(r => r.json())
-        .then(() => pollNow())
-        .catch(err => console.error(err));
-}
-
-function clearResults() {
-    const body = new URLSearchParams();
-    body.append('csrf_token', CSRF_TOKEN);
-    body.append('action', 'clear');
-
-    fetch(ENDPOINT, { method: 'POST', body: body })
-        .then(r => r.json())
-        .then(() => pollNow())
-        .catch(err => console.error(err));
-}
-
-// Initial fetch
-pollNow();
+$('hlb-plan').onclick=()=>start(true);
+$('hlb-run').onclick=()=>{
+  const b=$('hlb-run');
+  if(!b.classList.contains('confirm')){
+    b.classList.add('confirm'); b.textContent='Confirm: move data';
+    confirmTimer=setTimeout(()=>{b.classList.remove('confirm'); b.textContent='Run'},5000); return;
+  }
+  clearTimeout(confirmTimer); b.classList.remove('confirm'); b.textContent='Run'; start(false);
+};
+$('hlb-stop').onclick=()=>post({action:'stop'}).then(poll);
+$('hlb-clear').onclick=()=>post({action:'clear'}).then(poll);
+document.querySelectorAll('#hlb .chipbtn').forEach(b=>b.onclick=()=>{filter=b.dataset.f;document.querySelectorAll('#hlb .chipbtn').forEach(x=>x.setAttribute('aria-pressed',x===b));if(D)renderRows()});
+$('hlb-q').oninput=()=>D&&renderRows();
+$('hlb-copy').onclick=e=>{e.preventDefault();const t=$('hlb-log').textContent;(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>{e.target.textContent='Copied'},()=>{const r=document.createRange();r.selectNodeContents($('hlb-log'));getSelection().removeAllRanges();getSelection().addRange(r)}).finally(()=>setTimeout(()=>e.target.textContent='Copy log',1500))};
+for(let h=0;h<24;h++) $('s-hour').add(new Option(String(h).padStart(2,'0')+':00',h));
+$('hlb-settings').addEventListener('input',e=>{settingsDirty=true; if(e.target.id==='s-tol') $('s-tol-v').textContent=`±${e.target.value} %`; if(e.target.id==='s-sched') schedFields()});
+$('hlb-settings').addEventListener('change',()=>{settingsDirty=true; schedFields()});
+$('hlb-save').onclick=()=>{
+  const shares=[...document.querySelectorAll('#hlb-shares input:checked')].map(i=>i.dataset.share).join(',');
+  const xd=[...document.querySelectorAll('#hlb-xdisks input:checked')].map(i=>i.dataset.disk).join(',');
+  post({action:'save_settings',shares,exclude_disks:xd,tolerance:$('s-tol').value,min_size_mb:$('s-min').value,limit_gb:$('s-lim').value,
+    min_age_min:$('s-age').value,headroom_gb:$('s-head').value,schedule:$('s-sched').value,schedule_hour:$('s-hour').value,
+    schedule_dow:$('s-dow').value,unraid_notify:$('s-notify').checked?1:'',webhook:$('s-hook').value.trim()})
+  .then(r=>{$('hlb-save-msg').textContent=r.success?'Saved. New runs use these settings.':(r.msg||'Could not save'); if(r.success){settingsDirty=false; poll()}});
+};
+poll();
+})();
 </script>
-</body>
-</html>

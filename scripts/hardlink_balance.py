@@ -41,9 +41,19 @@ LOG_MAX_BYTES = 5 * 1024 * 1024             # /var/log is a small tmpfs: rotate 
 # Defaults, overridable in CFG_FILE (KEY="value" lines)
 CFG = {
     "WEBHOOK": "",                                   # optional Alertmanager-style webhook
+    "UNRAID_NOTIFY": "yes",                          # end-of-run alert in Unraid's notification bell
     "RUNS_DIR": "/boot/config/plugins/hardlink-balance/runs",
     "MIN_AGE_MIN": "60",                             # skip folders touched in the last N minutes
+    "SHARES": "",                                    # comma list of top-level shares to balance; empty = all
+    "EXCLUDE_DISKS": "",                             # comma list of disks never touched (source or destination)
+    "TOLERANCE": "2",                                # defaults for scheduled runs and the WebGUI
+    "MIN_SIZE_MB": "100",
+    "LIMIT_GB": "0",                                 # 0 = no cap
+    "HEADROOM_GB": "10",                             # free space always left on a destination
 }
+
+# Extra fields merged into every status write (plan flows, skipped counters) for the WebGUI
+STATUS_EXTRA = {}
 
 # Shares/directories that should never be rebalanced automatically
 DEFAULT_EXCLUDE_DIRS = {
@@ -124,6 +134,14 @@ def load_cfg():
 
 
 def notify(summary, description, severity="info"):
+    if CFG.get("UNRAID_NOTIFY", "yes").lower() in ("yes", "1", "true"):
+        level = {"info": "normal", "warning": "warning", "critical": "alert"}.get(severity, "normal")
+        try:
+            subprocess.run(["/usr/local/emhttp/webGui/scripts/notify", "-e", "EquiLink",
+                            "-s", summary, "-d", description[:900], "-i", level],
+                           capture_output=True, timeout=15)
+        except Exception as e:
+            log(f"WARNING Unraid notify failed: {e}")
     if not CFG["WEBHOOK"]:
         return
     payload = {
@@ -184,6 +202,8 @@ def cleanup_empty_parents(path, mount):
 
 
 def write_json_atomic(path, data):
+    if path == STATUS_FILE and STATUS_EXTRA:
+        data = {**STATUS_EXTRA, **data}
     tmp = f"{path}.tmp{os.getpid()}"
     try:
         with open(tmp, "w") as f:
@@ -259,21 +279,38 @@ def open_for_write(max_age=15):
     return s
 
 
+def guards():
+    """State of everything that must be idle before moving data (also shown in the WebGUI)."""
+    return {"parity": "parity check/rebuild in progress" if _parity_running() else "",
+            "mover": "Mover is running" if _mover_running() else "",
+            "rsync": _foreign_rsync()}
+
+
 def array_busy():
-    """Return a reason string if Mover / parity / unBALANCE is running, else ''."""
+    """Return a reason string if Mover / parity / another array rsync is running, else ''."""
+    g = guards()
+    return g["parity"] or g["mover"] or g["rsync"]
+
+
+def _parity_running():
     try:
         with open("/var/local/emhttp/var.ini") as f:
             for line in f:
                 if line.startswith("mdResyncPos="):
-                    if line.split("=", 1)[1].strip().strip('"') not in ("", "0"):
-                        return "parity check/rebuild in progress"
+                    return line.split("=", 1)[1].strip().strip('"') not in ("", "0")
     except OSError:
         pass
+    return False
+
+
+def _mover_running():
     if os.path.exists("/var/run/mover.pid"):
-        return "Mover is running"
+        return True
     r = subprocess.run(["pgrep", "-f", "/usr/local/sbin/mover"], capture_output=True, text=True)
-    if r.stdout.strip():
-        return "Mover is running"
+    return bool(r.stdout.strip())
+
+
+def _foreign_rsync():
     # unBALANCE's daemon is always up; it is only busy while one of its rsyncs runs.
     # Same for any other tool copying between array disks.
     r = subprocess.run(["pgrep", "-x", "rsync"], capture_output=True, text=True)
@@ -361,6 +398,10 @@ def discover_disks(mnt_root="/mnt", exclude_disks=None):
 
 # ── Scan & plan ──────────────────────────────────────────────────────────────
 
+def selected_shares():
+    return {x.strip() for x in CFG.get("SHARES", "").split(",") if x.strip()}
+
+
 def scan_disk_units(mount, min_size_kb, min_age_s, exclude_dirs=None):
     """
     Walk one disk and build movable folder units.
@@ -376,7 +417,9 @@ def scan_disk_units(mount, min_size_kb, min_age_s, exclude_dirs=None):
     groups = {}
     for root, dirs, files in os.walk(mount, followlinks=False):
         if root == mount:
-            dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith(".")]
+            only = selected_shares()
+            dirs[:] = [d for d in dirs if d not in exclude_dirs and not d.startswith(".")
+                       and (not only or d in only)]
         else:
             dirs[:] = [d for d in dirs if d not in exclude_dirs]
 
@@ -503,6 +546,9 @@ def build_plan(disks, tolerance, min_size_kb, min_age_s, limit_kb=None, run_star
             })
 
         units, skipped = scan_disk_units(s["mount"], min_size_kb, min_age_s)
+        tot = STATUS_EXTRA.setdefault("skipped", {})
+        for k, v in skipped.items():
+            tot[k] = tot.get(k, 0) + v
         log(f"  {src}: {len(units)} movable folders"
             + (f"; skipped {skipped}" if skipped else ""))
 
@@ -595,6 +641,9 @@ def summarize_plan(plan):
     for p in plan:
         by_pair[(p["src_disk"], p["dst_disk"])][0] += 1
         by_pair[(p["src_disk"], p["dst_disk"])][1] += p["size_kb"]
+    STATUS_EXTRA["flows"] = sorted(
+        ({"src": s, "dst": d, "groups": c, "size_kb": kb} for (s, d), (c, kb) in by_pair.items()),
+        key=lambda f: -f["size_kb"])
 
     log("=" * 70)
     log(f"PLAN: {len(plan)} groups, {fmt_kb(total_kb)} total")
@@ -743,24 +792,42 @@ def execute_group(group, disks):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tolerance", type=int, default=2, help="target +/- percent (default 2)")
-    ap.add_argument("--min-size-kb", type=int, default=0, help="skip folders whose biggest file is smaller")
+    ap.add_argument("--tolerance", type=int, default=None, help="target +/- percent (default from settings: 2)")
+    ap.add_argument("--min-size-kb", type=int, default=None, help="skip folders whose biggest file is smaller")
     ap.add_argument("--min-age-min", type=int, default=None, help="skip folders touched in the last N minutes")
     ap.add_argument("--limit-gb", type=float, default=None, help="cap total plan size (for a safe test run)")
-    ap.add_argument("--exclude-disks", type=str, default="", help="comma-separated disk names to exclude (e.g. disk8)")
+    ap.add_argument("--exclude-disks", type=str, default=None, help="comma-separated disk names to exclude (e.g. disk8)")
+    ap.add_argument("--guards", action="store_true", help="print the safety-check state as JSON and exit")
     ap.add_argument("--mnt-root", type=str, default="/mnt", help=argparse.SUPPRESS)  # tests
+    ap.add_argument("--cfg-file", type=str, default=None, help=argparse.SUPPRESS)  # tests
     ap.add_argument("--shares-cfg-dir", type=str, default=None, help=argparse.SUPPRESS)  # tests
     ap.add_argument("--headroom-mb", type=int, default=None, help=argparse.SUPPRESS)  # tests
     ap.add_argument("--execute", action="store_true", help="actually move data (default is dry-run)")
     ap.add_argument("--dry-run", action="store_true", help="dry-run only (default)")
     ap.add_argument("--stop", action="store_true", help="stop currently running instance")
     args = ap.parse_args()
+    if args.cfg_file:
+        global CFG_FILE
+        CFG_FILE = args.cfg_file
     load_cfg()
+    if args.guards:
+        print(json.dumps(guards()))
+        return
+    num = lambda k, d: float(CFG.get(k) or d)
+    if args.tolerance is None:
+        args.tolerance = max(1, min(10, int(num("TOLERANCE", 2))))
+    if args.min_size_kb is None:
+        args.min_size_kb = int(num("MIN_SIZE_MB", 100) * 1024)
+    if args.limit_gb is None and num("LIMIT_GB", 0) > 0:
+        args.limit_gb = num("LIMIT_GB", 0)
+    if args.exclude_disks is None:
+        args.exclude_disks = CFG.get("EXCLUDE_DISKS", "")
+    global MIN_FREE_HEADROOM_KB
+    MIN_FREE_HEADROOM_KB = int(num("HEADROOM_GB", 10) * 1024 * 1024)
     if args.shares_cfg_dir:
         global SHARES_CFG_DIR
         SHARES_CFG_DIR = args.shares_cfg_dir
     if args.headroom_mb is not None:
-        global MIN_FREE_HEADROOM_KB
         MIN_FREE_HEADROOM_KB = args.headroom_mb * 1024
 
     if args.stop:
@@ -1011,6 +1078,9 @@ def main():
             write_json_atomic(os.path.join(runs_dir, f"run_{run_id}.json"), {
                 "run_id": run_id,
                 "state": state,
+                "trigger": os.environ.get("HLB_TRIGGER", "manual"),
+                "out_of_band_after": sum(1 for d in disks_after.values()
+                                         if abs(d["pct"] - target_pct) > args.tolerance),
                 "tolerance": args.tolerance,
                 "min_size_kb": args.min_size_kb,
                 "min_age_min": min_age_min,

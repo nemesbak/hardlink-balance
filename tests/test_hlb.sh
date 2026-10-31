@@ -1,7 +1,7 @@
 #!/bin/bash
 # Pruebas de hardlink_balance.py con 3 discos XFS falsos en RAM
 set -u
-PY="python3 $(dirname "$0")/../scripts/hardlink_balance.py --mnt-root /tmp/hlbt --headroom-mb 5"
+PY="python3 $(dirname "$0")/../scripts/hardlink_balance.py --mnt-root /tmp/hlbt --headroom-mb 5 --min-size-kb 0"
 R=/tmp/hlbt; FAIL=0; HOLD=
 ok(){ echo "  OK   $*"; }; ko(){ echo "  FALLO $*"; FAIL=1; }
 cleanup(){ kill $HOLD 2>/dev/null; for d in 91 92 93; do umount $R/disk$d 2>/dev/null; done; rm -rf $R /tmp/hlbimg; }
@@ -49,7 +49,7 @@ find $R -name '*.hlb-tmp' | grep -q . && ko "tmp" ; true
 echo "== 3) parada a mitad de copia (rsync lento con bwlimit)"
 mk "$R/disk91/datos/media/peliculas/Lenta/l.mkv" 25
 sed 's/\["rsync", "-aX"/["rsync", "-aX", "--bwlimit=5000"/' $(dirname "$0")/../scripts/hardlink_balance.py > /tmp/hb_slow.py
-python3 /tmp/hb_slow.py --mnt-root $R --headroom-mb 5 --execute --min-age-min 0 --tolerance 1 >/dev/null & P=$!
+python3 /tmp/hb_slow.py --mnt-root $R --headroom-mb 5 --min-size-kb 0 --execute --min-age-min 0 --tolerance 1 >/dev/null & P=$!
 sleep 2; python3 $(dirname "$0")/../scripts/hardlink_balance.py --stop >/dev/null; wait $P
 [ -f "$R/disk91/datos/media/peliculas/Lenta/l.mkv" ] && ok "origen intacto tras parar" || ko "origen tras parar"
 find $R -name '*.hlb-tmp' | grep -q . && ko "quedó temporal tras parar" || ok "temporal borrado al parar"
@@ -61,11 +61,16 @@ mkdir -p /tmp/hlbshares; echo 'shareExclude="disk93"' > /tmp/hlbshares/solo92.cf
 rm -rf $R/disk91/datos/media/peliculas/Lenta; mk "$R/disk91/solo92/peli/s.mkv" 20
 echo basura > $R/disk93/.huerfano.mkv.hlb-tmp
 mkdir -p $R/disk93/datos/x; echo basura > $R/disk93/datos/x/.h.mkv.hlb-tmp
-python3 $(dirname "$0")/../scripts/hardlink_balance.py --mnt-root $R --headroom-mb 5 --shares-cfg-dir /tmp/hlbshares --execute --min-age-min 0 --tolerance 10 > /tmp/hlbt4.out
+python3 $(dirname "$0")/../scripts/hardlink_balance.py --mnt-root $R --headroom-mb 5 --min-size-kb 0 --shares-cfg-dir /tmp/hlbshares --execute --min-age-min 0 --tolerance 10 > /tmp/hlbt4.out
 grep -E "MOVED|Target|disk9" /tmp/hlbt4.out | tail -8
 [ -f $R/disk92/solo92/peli/s.mkv ] && ok "share movido a disk92 (disk93 excluido)" || { [ -f $R/disk93/solo92/peli/s.mkv ] && ko "share puesto en disco excluido" || ko "share no movido"; }
 [ -e $R/disk93/datos/x/.h.mkv.hlb-tmp ] && ko "temporal huérfano en destino sigue" || ok "temporal huérfano en destino borrado"
 rm -rf /tmp/hlbshares
 df -h $R/disk9* | tail -3
+echo "== 5) ajuste SHARES: solo se escanea el share elegido"
+mk "$R/disk91/otro/x/o.mkv" 15; mk "$R/disk91/elegido/y/e.mkv" 15
+echo 'SHARES="elegido"' > /tmp/hlb5.cfg
+python3 $(dirname "$0")/../scripts/hardlink_balance.py --cfg-file /tmp/hlb5.cfg --mnt-root $R --headroom-mb 5 --min-size-kb 0 --dry-run --min-age-min 0 --tolerance 1 > /tmp/hlbt5.out
+rm -f /tmp/hlb5.cfg
 cleanup
 [ $FAIL = 0 ] && echo "TODAS LAS PRUEBAS OK" || echo "HAY FALLOS"

@@ -1,175 +1,161 @@
 <p align="center">
-  <img src="images/hardlink-balance.png" alt="EquiLink Logo" width="96" height="96">
+  <img src="images/hardlink-balance.png" alt="EquiLink logo" width="96" height="96">
 </p>
 
-<h1 align="center">EquiLink for Unraid ⚖️🔗</h1>
-<h3 align="center">The Unraid array disk-usage balancer that never breaks hardlinks.</h3>
+<h1 align="center">EquiLink for Unraid</h1>
+<p align="center"><b>Balances the fill of your array disks without ever breaking a hardlink.</b></p>
 
 <p align="center">
-  <a href="https://unraid.net"><img src="https://img.shields.io/badge/Unraid-6.12%2B%20%7C%207.x-orange.svg" alt="Unraid Version"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License"></a>
-  <a href="https://github.com/nemesbak/hardlink-balance/releases"><img src="https://img.shields.io/badge/Release-v2026.10.30-10b981.svg" alt="Release"></a>
-  <img src="https://img.shields.io/badge/Engine-Inode--Aware%20Safe-0284c7.svg" alt="Engine">
+  <a href="https://unraid.net"><img src="https://img.shields.io/badge/Unraid-6.12%2B%20%7C%207.x-orange.svg" alt="Unraid 6.12+ and 7.x"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/version-2026.10.31b-c4621d.svg" alt="Version 2026.10.31b">
+  <img src="https://img.shields.io/badge/tests-19%20passing-3a8a3f.svg" alt="19 tests passing">
 </p>
 
----
+![EquiLink with a plan ready: disks, target band and projected fill](docs/screenshots/plan_dark.png)
 
-## 📸 Screenshots
+## Why
 
-### 1. Analysis Mode (Dark Theme) — Real-Time Array Distribution & Zero-Duplication Shield
-![EquiLink Dashboard Analysis Dark](docs/screenshots/screenshot_analysis_dark.png)
+If qBittorrent seeds a file and Sonarr, Radarr, Plex, Jellyfin or Emby show the same file from your library, those two paths are **one file with two names** (a hardlink). It takes space once.
 
-### 2. Live Balancing in Action — Real-Time Transfer Speed, ETA & Multi-Linked Rebuilding
-![EquiLink Balancing Dark](docs/screenshots/screenshot_balancing_dark.png)
+Classic balancers move one path at a time with `rsync`. The two names end up on different disks, the file now exists twice, and your "balanced" array is fuller than before.
 
-### 3. Light Theme Support (Seamless Dynamix Integration)
-![EquiLink Dashboard Light](docs/screenshots/screenshot_analysis_light.png)
-
----
-
-## ⚡ The Problem with Traditional Balancers
-
-If you use **qBittorrent** alongside media managers like **Radarr**, **Sonarr**, **Plex**, or **Jellyfin**, your media files share hardlinks. Hardlinks allow a downloaded video file in your torrent folder to exist simultaneously in your media library without consuming double disk space.
-
-Existing Unraid plugins (such as *unBALANCE* or *ReBalance*) move files one-by-one with plain `rsync`:
-* **They silently break every hardlinked pair across disks.**
-* When a movie or episode is moved, its link to the active torrent is severed, resulting in **two distinct copies** on different drives.
-* Space usage doubles, parity gets thrashed, and when qBittorrent attempts to manage or clean up completed torrents, it runs into `Permission denied` or creates orphan files.
+EquiLink groups every path by inode, moves the whole group to the same destination disk and recreates the links there. The file still takes space once, seeding keeps working and the library does not notice.
 
 ```
-Traditional Balancers (unBALANCE / ReBalance):
-[Torrent Folder] ──(hardlink)──> [Media Library]
-       │                                │
-       ▼ (rsync moves file-by-file)     ▼
- [Disk 1: Remains]             [Disk 2: Duplicate Created!]
- ❌ RESULT: 2x DISK USAGE, BROKEN SEEDS, PERMISSION DENIED
-
-EquiLink (Inode-Aware Engine):
-[Torrent Folder] ──(shared inode st_dev:st_ino)──> [Media Library]
-       │                                                  │
-       └──────────────────┬───────────────────────────────┘
-                          ▼ (atomic group transfer)
- [Disk 2: Copied primary file + Recreated native hardlinks (os.link)]
- ✅ RESULT: 1x DISK USAGE, ZERO DUPLICATION, 100% SEED INTEGRITY
+Plain rsync balancer                         EquiLink
+torrents/Movie.mkv ─┐                        torrents/Movie.mkv ─┐
+                    ├─ 1 inode on disk1                          ├─ 1 inode on disk1
+media/Movie.mkv  ───┘                        media/Movie.mkv  ───┘
+        │ moves only media/                          │ moves the group
+        ▼                                            ▼
+disk1: torrents/Movie.mkv   (copy 1)         disk3: torrents/Movie.mkv ─┐ 1 inode,
+disk3: media/Movie.mkv      (copy 2)         disk3: media/Movie.mkv   ──┘ links kept
 ```
 
----
+## Screenshots
 
-## ✨ Features & Guarantees
+| Run in progress | Light theme |
+| :---: | :---: |
+| ![Run in progress](docs/screenshots/running_dark.png) | ![Light theme](docs/screenshots/plan_light.png) |
 
-| Feature | Description |
+![Settings](docs/screenshots/settings_dark.png)
+
+The page follows your Unraid theme (dark for Black and Gray, light for White and Azure).
+
+## What you get
+
+- **Disks at a glance.** Each disk's fill against the target band, which disks will send or receive data, and where each one ends up after the plan.
+- **Simulate before you move.** A simulation shows every planned move, the disk-to-disk routes and how much of it is hardlinked. Nothing moves until you press Run and confirm.
+- **Live progress.** Data moved, speed, time left, the file being copied and the status of each move.
+- **Safety checks on screen.** Mover, parity operations and other array copies are shown and re-checked during the run.
+- **History.** Every run that moved data leaves a report: when, how much, how long and whether anything needs a look.
+- **Automatic runs.** Daily, weekly or monthly, with an optional cap per run so a big rebalance spreads over several nights.
+- **Notifications.** In the Unraid notification bell and, optionally, a webhook.
+
+## Safety model
+
+EquiLink was written for arrays that are in use while it runs: downloads arriving, *arr apps importing, media servers streaming.
+
+**What moves.** Whole folders (a season, a movie), oldest first. A folder moves only if every link of every file in it was found on that disk. A folder is skipped when:
+
+- a file in it changed or got a new hardlink recently (default: last hour);
+- a file is open for writing by any process (detected through `/proc`, including Unraid's `shfs`);
+- a file is a partial download (`.!qB`, `.part`, `.crdownload`, …);
+- a file has a link outside the scanned shares (the link count does not match).
+
+**How it moves.**
+
+1. Checks that no destination path already exists. Nothing is ever overwritten.
+2. Copies the file with `rsync` to a hidden temp file on the destination and checks the size.
+3. Flushes the copy to disk (`fsync`), re-checks the source (same inode, link count, size, mtime, no writers) and publishes it with a no-clobber `link()`.
+4. Recreates every other link next to it and flushes the new folder entries.
+5. Only then removes the originals and prunes empty folders.
+
+If anything changes on the way, the group is skipped and the source stays as it was. Stop aborts the copy in flight and deletes its temp file. Temp files left by a crash or power cut are removed at the start of the next run.
+
+**When it refuses to run.** While the Mover, a parity check or rebuild, or another `rsync` between `/mnt/disk*` (unBALANCE, for example) is active. These checks repeat every 25 groups during a run.
+
+**Where it puts data.** Never on a disk excluded from that share (`shareInclude` / `shareExclude` in the share settings), never on a disk you told EquiLink to leave alone, and always leaving free space on the destination (10 GB by default).
+
+## Fits different setups
+
+| Your setup | What to set |
 | :--- | :--- |
-| **🛡️ Inode-Aware Grouping** | Walks source disks and groups files strictly by physical inode `(st_dev, st_ino)`. Files sharing disk blocks are always planned and moved as a single unit. |
-| **🔗 Native Hardlink Rebuilding** | Replicates the primary file via `rsync -aX`, verifies file size, and recreates all secondary paths on the destination disk using native filesystem `os.link`. |
-| **🚫 Collision Prevention Guard** | Proactively checks if destination file paths already exist before transferring. Never overwrites existing files. |
-| **⚡ Concurrent Write Guard** | Compares `st_size` and `st_mtime` before and after transfer. If a file is modified mid-copy (e.g. active torrent download), it skips it and safely rolls back. |
-| **🧹 Empty Directory Pruning** | Automatically prunes empty parent directory hierarchies on the source disk up to the share root after moving files. |
-| **💾 ZFS & XFS Child Mount Support** | ZFS disks are measured at pool level, so child datasets (e.g. `/mnt/diskN/datos`) are counted. |
-| **👤 Nobody:Users Ownership** | Automatically enforces `nobody:users` (99:100) and `0775` permissions on all newly created folders and files. |
-| **🔍 Live Interactive Plan Search** | Real-time search bar and filter chips (*All*, *Hardlinks Only*, *Single Files*) to inspect the transfer plan instantly in the WebGUI. |
-| **⏹️ Graceful Stop** | Halts execution cleanly after the currently active file group completes, ensuring zero partial or broken files. |
+| One `data` share with torrents and media together (TRaSH layout) | Defaults work. |
+| Several shares, but only some should move | Tick them under **Shares to balance**. |
+| A disk you want to keep as it is (archive, near failure, different speed) | Tick it under **Disks to leave alone**. It is not touched and does not count toward the target. |
+| Large array, short quiet hours | Set **Limit per run** (e.g. 500 GB) and **Automatic runs** at night. |
+| Downloads that take hours to import | Raise **Leave recent folders for** to 6 hours or 1 day. |
+| Small disks, or ones that fill up fast | Raise **Keep free on destination**. |
+| ZFS disks in the array | Supported. Capacity is read from the pool (`zfs list`), so child datasets such as `/mnt/disk8/data` count. |
+| XFS or Btrfs disks | Supported. |
+| Parity or no parity | Both work. With parity, moves are slower because every write updates parity. |
+| No internet at boot | Supported. Plugin files are cached on the flash drive and checked by MD5. |
 
----
+System shares (`system`, `appdata`, `domains`, `isos`) and pool-only shares are never scanned.
 
-## 🚀 Installation
+## Install
 
-### Option 1: Via Unraid WebGUI (1-Click Install)
-1. In your Unraid WebGUI, navigate to **Plugins** → **Install Plugin**.
-2. Paste the following URL:
-   ```text
-   https://raw.githubusercontent.com/nemesbak/hardlink-balance/main/hardlink-balance.plg
-   ```
-3. Click **Install**.
-4. The plugin will appear immediately under **Tools** → **EquiLink (Hardlink Balance)**.
+**Plugins → Install Plugin**, paste and press Install:
 
-### Option 2: Community Applications (Pending Moderation)
-Once indexed, simply search for **`EquiLink`** or **`Hardlink`** in the Unraid **Apps** tab and click Install.
-
----
-
-## 🖥️ WebGUI Quick Tour
-
-* **Array Disks Distribution**: Real-time capacity bars with target utilization line (e.g. `Target: 69%`), `XFS` / `ZFS` filesystem badges, and delta transfer indicators (`↓ 2.29 TB` to shed, `↑ 1.22 TB` headroom).
-* **Zero-Duplication Shield**: Prominently displays the exact number of hardlink groups and total GB protected from redundant cloning (e.g. `2,050 groups · 3.52 TB preserved`).
-* **One-Click Presets**:
-  * ⚡ **Fast Media Balance**: Filters files $>100\text{ MB}$, skipping tiny metadata (NFOs, subtitles) for maximum speed.
-  * 🧪 **Safe Test Batch**: Caps transfers to 50 GB for a controlled first run.
-  * 🌐 **Deep Array Balance**: Complete comprehensive balance across all files.
-* **Live Activity Console**: Terminal output with colorized events (`MOVED`, `PLAN`, `WARNING`, `ERROR`) and a 1-click **Copy Log** button.
-
----
-
-## ⌨️ CLI Usage (Optional)
-
-EquiLink can also be executed directly from the Unraid terminal or via SSH:
-
-```bash
-# 1. Safe Simulation / Dry-run (does not move any data)
-python3 /usr/local/emhttp/plugins/hardlink-balance/scripts/hardlink_balance.py --dry-run
-
-# 2. Fast media analysis skipping files under 100 MB
-python3 /usr/local/emhttp/plugins/hardlink-balance/scripts/hardlink_balance.py --dry-run --min-size-kb 102400
-
-# 3. Safe execution capped to 50 GB
-python3 /usr/local/emhttp/plugins/hardlink-balance/scripts/hardlink_balance.py --execute --limit-gb 50
-
-# 4. Full balance excluding a specific disk (e.g. disk8)
-python3 /usr/local/emhttp/plugins/hardlink-balance/scripts/hardlink_balance.py --execute --tolerance 2 --exclude-disks disk8
-
-# 5. Gracefully stop a running instance
-python3 /usr/local/emhttp/plugins/hardlink-balance/scripts/hardlink_balance.py --stop
+```text
+https://raw.githubusercontent.com/nemesbak/hardlink-balance/main/hardlink-balance.plg
 ```
 
-### CLI Arguments Reference
-
-| Argument | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--dry-run` | Flag | Default | Build and summarize move plan without touching data. |
-| `--execute` | Flag | False | Actually move files and rebuild hardlinks. |
-| `--tolerance` | Integer | `2` | Target ±% variance across array disks (e.g. `2` means $69\% \pm 2\%$). |
-| `--min-size-kb` | Integer | `0` | Skip files smaller than this threshold (e.g. `102400` = 100 MB). |
-| `--limit-gb` | Float | None | Cap total transferred data in this run (e.g. `50`). |
-| `--exclude-disks` | String | None | Comma-separated list of disks to exclude (e.g. `disk8,disk9`). |
-| `--stop` | Flag | False | Send graceful SIGTERM to halt the running balancer cleanly. |
-
----
-
-## ❓ Frequently Asked Questions (FAQ)
-
-#### Does this break torrent seeding in qBittorrent?
-**No.** That is the entire reason EquiLink was created. When EquiLink moves a file that is seeded in qBittorrent and organized in your Jellyfin/Radarr library, it copies the primary file and recreates all other paths on the destination drive using native filesystem hardlinks (`os.link`). qBittorrent continues seeding without rechecking.
-
-#### What happens if a transfer is interrupted or stopped?
-EquiLink uses a two-phase commit: only after the copy is completely finished and all hardlinks are verified on the destination drive does it remove the originals from the source drive. If stopped, the in-flight file finishes cleanly and execution halts. No partial or corrupt files are ever created.
-
-#### Is ZFS supported?
-**Yes.** On ZFS disks EquiLink reads the pool's used/available (`zfs list`), so child datasets such as `/mnt/diskN/datos` are included.
-
----
-
-## 📄 License
-
-MIT License. Designed and maintained for the Unraid community.
-
-## Active-download safety
-
-Torrent ↔ library hardlinks are moved together, and a folder is **skipped** when any of these is true:
-
-- a file in it was modified or got a new hardlink in the last `MIN_AGE_MIN` minutes (default 60);
-- a file is open for writing by any process (qBittorrent, *arr, HandBrake… detected through `/proc`, including shfs);
-- a file is a partial download (`.!qB`, `.part`, …);
-- a hardlink of a file lives somewhere the scan can't see (link count mismatch).
-
-Right before deleting the source, every link is re-checked (same inode, link count, size, mtime, no writers).
-Runs are refused while Mover, a parity check or another rsync between array disks (unBALANCE) is active.
-Seeding keeps working: qBittorrent reads the file through `/mnt/user`, which follows it to the new disk.
+The page appears under **Tools → EquiLink (Hardlink Balance)**. Start with **Simulate**.
 
 ## Settings
 
-`/boot/config/plugins/hardlink-balance/hardlink-balance.cfg`:
+Everything is set from the page and saved to `/boot/config/plugins/hardlink-balance/hardlink-balance.cfg`. Uninstalling keeps this file and your run history.
 
-| Key | Default | |
-|---|---|---|
-| `WEBHOOK` | empty | Alertmanager-style webhook for end-of-run alerts |
-| `RUNS_DIR` | `/boot/config/plugins/hardlink-balance/runs` | JSON report per executed run |
-| `MIN_AGE_MIN` | `60` | Skip folders touched in the last N minutes |
+| Key | Default | Meaning |
+| :--- | :--- | :--- |
+| `SHARES` | empty | Shares to balance, comma separated. Empty = all array shares except system shares. |
+| `EXCLUDE_DISKS` | empty | Disks never read from or written to. |
+| `TOLERANCE` | `2` | How far (in %) a disk may sit from the target fill. |
+| `MIN_SIZE_MB` | `100` | Folders whose biggest file is smaller are ignored. |
+| `LIMIT_GB` | `0` | Maximum data per run. `0` = no cap. |
+| `MIN_AGE_MIN` | `60` | Leave folders changed in the last N minutes. |
+| `HEADROOM_GB` | `10` | Free space always left on a destination disk. |
+| `SCHEDULE` | `off` | `off`, `daily`, `weekly` or `monthly`. |
+| `SCHEDULE_HOUR` / `SCHEDULE_DOW` | `3` / `0` | Hour of automatic runs; weekday for weekly runs (0 = Sunday). |
+| `UNRAID_NOTIFY` | `yes` | Send a notification to the Unraid bell when a run ends. |
+| `WEBHOOK` | empty | Alertmanager-style JSON webhook, sent when a run ends. |
+| `RUNS_DIR` | `/boot/config/plugins/hardlink-balance/runs` | One JSON report per run that moved data. |
+
+## Command line
+
+```bash
+E=/usr/local/emhttp/plugins/hardlink-balance/scripts/hardlink_balance.py
+
+python3 $E --dry-run                        # simulate with your saved settings
+python3 $E --execute --limit-gb 50          # move at most 50 GB
+python3 $E --execute --exclude-disks disk8  # leave disk8 alone this time
+python3 $E --stop                           # stop a running balance
+python3 $E --guards                         # Mover / parity / rsync state as JSON
+```
+
+Command-line flags (`--tolerance`, `--min-size-kb`, `--min-age-min`, `--limit-gb`, `--exclude-disks`) override the saved settings for that run only.
+
+## Tests
+
+`tests/test_hlb.sh` builds three throwaway XFS disks in RAM and runs 19 checks: links kept, content identical, recent, open and partial files left alone, no overwrite on collision, stop in the middle of a copy, share exclusions, crash leftovers and the share filter. Run it as root on the server:
+
+```bash
+bash tests/test_hlb.sh
+```
+
+## FAQ
+
+**Does seeding break?** No. qBittorrent reads through `/mnt/user`, which finds the file on its new disk, and the link to the library is kept. No recheck is needed.
+
+**Can I use it while people are streaming?** Yes. Reading a file that is being moved is fine; the media server keeps the old copy open until it closes it. Disks are busier, so schedule big runs at night.
+
+**What does "on both disks" mean in the report?** The copy was made but an original could not be removed (for example, permissions). Nothing is lost; the file exists twice until you remove one. You also get a notification.
+
+**Why is a disk not getting emptier?** If a process holds a moved file open (a torrent client seeding it, for example), its space is freed when the process closes it.
+
+## License
+
+MIT.
