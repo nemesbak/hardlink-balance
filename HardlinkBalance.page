@@ -9,6 +9,11 @@ $var   = @parse_ini_file('/var/local/emhttp/var.ini') ?: [];
 $csrf  = $var['csrf_token'] ?? '';
 $theme = $display['theme'] ?? (@parse_ini_file('/boot/config/plugins/dynamix/dynamix.cfg', true)['display']['theme'] ?? 'white');
 $dark  = in_array($theme, ['black', 'gray'], true);
+// Language: the setting wins; "auto" follows Unraid's language (Settings > Display Settings)
+$hlbCfg = @parse_ini_file('/boot/config/plugins/hardlink-balance/hardlink-balance.cfg') ?: [];
+$uiLoc  = $locale ?? (@parse_ini_file('/boot/config/plugins/dynamix/dynamix.cfg', true)['display']['locale'] ?? '');
+$lang   = $hlbCfg['LANGUAGE'] ?? 'auto';
+if (!in_array($lang, ['en', 'es'], true)) $lang = strncmp((string)$uiLoc, 'es', 2) === 0 ? 'es' : 'en';
 ?>
 <style>
 /* Layout: one operator column — summary strip, disk instrument (bars + target band), run + routes, guards, moves, settings, history. */
@@ -315,8 +320,9 @@ $dark  = in_array($theme, ['black', 'gray'], true);
           <div class="field"><label for="s-sched">Automatic runs</label><select id="s-sched"><option value="off">Off</option><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly (day 1)</option></select></div>
           <div class="field"><label for="s-hour">At</label><select id="s-hour"></select></div>
           <div class="field"><label for="s-dow">On</label><select id="s-dow"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></select></div>
+          <div class="field"><label for="s-lang">Language</label><select id="s-lang"><option value="auto">Same as Unraid</option><option value="en">English</option><option value="es">Español</option></select></div>
           <div class="field"><label>Notifications</label><label class="check" for="s-notify"><input id="s-notify" type="checkbox" checked> Unraid notification when a run ends</label></div>
-          <div class="field" style="grid-column:span 3"><label for="s-hook">Webhook (optional)</label><input id="s-hook" type="url" placeholder="http://127.0.0.1:5678/webhook/alerts"><div class="hint">Alertmanager-style JSON, sent when a run ends with problems or moved data.</div></div>
+          <div class="field" style="grid-column:span 2"><label for="s-hook">Webhook (optional)</label><input id="s-hook" type="url" placeholder="http://127.0.0.1:5678/webhook/alerts"><div class="hint">Alertmanager-style JSON, sent when a run ends with problems or moved data.</div></div>
         </div>
         <div class="sfoot">
           <span class="sub" id="hlb-save-msg">Saved to /boot/config/plugins/hardlink-balance/hardlink-balance.cfg</span>
@@ -343,13 +349,93 @@ $dark  = in_array($theme, ['black', 'gray'], true);
 (function(){
 const ENDPOINT='/plugins/hardlink-balance/scripts/status.php';
 const CSRF=<?= json_encode($csrf) ?>;
+const LANG=<?= json_encode($lang) ?>;
 const $=id=>document.getElementById(id);
 let D=null, filter='all', settingsDirty=false, confirmTimer=null, rates=[];
 
+/* ---------- i18n: English is the source text; other languages map it ---------- */
+const DICT={es:{
+ 'Balances array disks without breaking hardlinks':'Equilibra los discos del array sin romper hardlinks',
+ 'Simulate':'Simular','Run':'Ejecutar','Stop':'Parar','Clear result':'Borrar resultado','Confirm: move data':'Confirmar: mover datos',
+ 'Status':'Estado','Target fill':'Llenado objetivo','band ±':'banda ±','Spread':'Diferencia','fullest vs emptiest':'más lleno frente a más vacío',
+ 'Planned':'Planificado','run Simulate to plan':'pulsa Simular para planificar','Out of band':'Fuera de banda','Loading…':'Cargando…',
+ 'Disks':'Discos','Source':'Origen','Destination':'Destino','In band':'En banda','Excluded':'Excluido','Target band':'Banda objetivo','▾ After plan':'▾ Tras el plan',
+ 'Current run':'Pasada actual','Plan by route':'Plan por rutas','Composition':'Composición',
+ 'Safety checks':'Comprobaciones de seguridad','re-checked every 25 groups during a run':'se repiten cada 25 grupos durante la pasada',
+ 'Skipped folders':'Carpetas saltadas','left untouched this run':'no se tocan en esta pasada',
+ 'A folder (season, movie) moves as a whole, and only when every link of every file in it was found on the same disk. Anything else stays where it is.':'Una carpeta (temporada, película) se mueve entera, y solo si todos los enlaces de todos sus archivos están en el mismo disco. Lo demás se queda donde está.',
+ 'Moves':'Movimientos','Search path or disk':'Buscar ruta o disco','All':'Todos','Hardlinked':'Con enlaces','Single':'Únicos',
+ 'Path':'Ruta','Size':'Tamaño','Links':'Enlaces','Settings':'Ajustes','Shares to balance':'Shares a equilibrar',
+ 'None ticked means every share except system, appdata, domains and isos.':'Si no marcas ninguno, se usan todos menos system, appdata, domains e isos.',
+ 'Disks to leave alone':'Discos que no se tocan',
+ 'Excluded disks are never read from or written to and do not count toward the target fill.':'Los discos excluidos no se leen ni se escriben y no cuentan para el llenado objetivo.',
+ 'Tolerance':'Tolerancia','How far a disk may sit from the target.':'Cuánto puede alejarse un disco del objetivo.',
+ 'Minimum size (MB)':'Tamaño mínimo (MB)','Folders whose biggest file is smaller are ignored.':'Se ignoran las carpetas cuyo archivo más grande sea menor.',
+ 'Limit per run (GB)':'Límite por pasada (GB)','0 moves everything in one run.':'0 mueve todo en una sola pasada.',
+ 'Leave recent folders for':'No tocar carpetas recientes durante','15 minutes':'15 minutos','1 hour':'1 hora','6 hours':'6 horas','1 day':'1 día',
+ 'Protects downloads that are still being imported.':'Protege las descargas que aún se están importando.',
+ 'Keep free on destination (GB)':'Dejar libre en destino (GB)','Automatic runs':'Pasadas automáticas','Off':'Desactivadas','Daily':'Diarias','Weekly':'Semanales','Monthly (day 1)':'Mensuales (día 1)',
+ 'At':'A las','On':'El','Sunday':'domingo','Monday':'lunes','Tuesday':'martes','Wednesday':'miércoles','Thursday':'jueves','Friday':'viernes','Saturday':'sábado',
+ 'Notifications':'Avisos','Unraid notification when a run ends':'Aviso de Unraid al terminar una pasada','Language':'Idioma','Same as Unraid':'El de Unraid',
+ 'Webhook (optional)':'Webhook (opcional)','Alertmanager-style JSON, sent when a run ends with problems or moved data.':'JSON estilo Alertmanager, enviado al terminar una pasada con problemas o datos movidos.',
+ 'Saved to /boot/config/plugins/hardlink-balance/hardlink-balance.cfg':'Se guarda en /boot/config/plugins/hardlink-balance/hardlink-balance.cfg',
+ 'Save settings':'Guardar ajustes','History':'Historial','Log':'Log','Copy log':'Copiar log','Copied':'Copiado','No log yet.':'Todavía no hay log.',
+ /* dynamic */
+ 'Idle':'En reposo','Starting':'Arrancando','Planning':'Planificando','Plan ready':'Plan listo','Moving':'Moviendo','Finished':'Terminado','Stopped':'Parado','Error':'Error','Simulation':'Simulación',
+ 'No array disks are mounted. Start the array to see them.':'No hay discos del array montados. Arranca el array para verlos.',
+ '{0} free':'{0} libres','spun down':'en reposo','pts':'pts','{0} source · {1} destination':'{0} origen · {1} destino',
+ 'Ready. Simulate first to see what would move.':'Listo. Simula primero para ver qué se movería.',
+ 'Scanning {0} ({1} of {2} source disks)':'Leyendo {0} ({1} de {2} discos origen)',
+ 'Simulation finished · nothing was moved':'Simulación terminada · no se ha movido nada',
+ 'Started {0} · {1} elapsed':'Empezó {0} · lleva {1}','{0} moved · {1} skipped':'{0} movidos · {1} saltados',
+ 'Every disk is inside the band':'Todos los discos están dentro de la banda','Stopped after {0} · sources untouched':'Parado tras {0} · originales intactos',
+ 'The engine reported an error':'El motor ha dado un error','{0} groups · {1} hardlinked':'{0} grupos · {1} con enlaces',
+ 'Run is paused: {0}. Simulate still works.':'Ejecutar está en pausa: {0}. Simular sí funciona.',
+ '{0} groups were skipped. The log says why; nothing was lost.':'Se saltaron {0} grupos. El log dice por qué; no se ha perdido nada.',
+ 'Lost contact with the server. Retrying…':'Sin conexión con el servidor. Reintentando…','Could not start':'No se pudo arrancar',
+ 'of {0} · {1} %':'de {0} · {1} %','Group {0} of {1} · {2} skipped':'Grupo {0} de {1} · {2} saltados',
+ 'Speed':'Velocidad','Time left':'Queda','Hardlinked groups':'Grupos con enlaces','Copying now':'Copiando ahora','{0} links':'{0} enlaces',
+ 'Scanning…':'Leyendo…','Reading {0} and grouping files by inode. Large disks take a few seconds each.':'Leyendo {0} y agrupando archivos por inodo. Los discos grandes tardan unos segundos cada uno.',
+ 'the source disks':'los discos origen','in {0} groups':'en {0} grupos',
+ 'Nothing has moved yet. Press Run to apply this plan; every group is re-checked right before it moves.':'Todavía no se ha movido nada. Pulsa Ejecutar para aplicar el plan; cada grupo se vuelve a comprobar justo antes de moverlo.',
+ 'Runs needed':'Pasadas necesarias','Routes':'Rutas','moved in {0}':'movidos en {0}','Groups moved':'Grupos movidos','Skipped':'Saltados','Avg speed':'Velocidad media',
+ 'No run in progress':'No hay ninguna pasada','Automatic runs: {0}.':'Pasadas automáticas: {0}.',
+ 'Automatic runs are off. You can turn them on in Settings.':'Las pasadas automáticas están desactivadas. Puedes activarlas en Ajustes.',
+ 'Last run':'Última','Moved':'Movido','Problems':'Problemas',
+ 'No plan yet. Simulate shows which disk sends data where.':'Aún no hay plan. Simular muestra qué disco envía datos a cuál.',
+ 'and {0} smaller routes':'y {0} rutas más pequeñas','{0} routes · {1}':'{0} rutas · {1}',
+ 'Hardlinked · {0} · {1} groups':'Con enlaces · {0} · {1} grupos','Single files · {0} · {1} groups':'Archivo único · {0} · {1} grupos',
+ 'Mover is running':'El Mover está en marcha','Mover idle':'Mover parado','runs wait until it finishes':'las pasadas esperan a que termine',
+ 'checked before and during runs':'se comprueba antes y durante la pasada','Parity check running':'Comprobación de paridad en curso',
+ 'No parity operation':'Sin operación de paridad','parity check or rebuild':'comprobación o reconstrucción de paridad',
+ 'Another copy is running':'Hay otra copia en curso','No other array copy':'Ninguna otra copia en el array','unBALANCE or any rsync between /mnt/disk*':'unBALANCE o cualquier rsync entre /mnt/disk*',
+ 'Open files are skipped':'Los archivos abiertos se saltan','anything open for writing (downloads, imports) stays put':'lo que esté abierto para escritura (descargas, importaciones) no se mueve',
+ 'Copy is on disk before delete':'Copia grabada antes de borrar','each copy and its folder are flushed (fsync) first':'cada copia y su carpeta se graban (fsync) primero',
+ 'Only {0} share(s)':'Solo {0} share(s)','All user shares':'Todos los shares','system shares excluded':'sin los shares de sistema',' · leaving {0} alone':' · sin tocar {0}',
+ 'partial download (.!qB, .part…)':'descarga a medias (.!qB, .part…)','changed too recently':'cambiada hace poco','open for writing':'abierta para escritura',
+ 'a link lives outside the scanned shares':'un enlace está fuera de los shares escaneados','Shown after a simulation or run.':'Aparece tras simular o ejecutar.',
+ '· showing {0} of {1}':'· se muestran {0} de {1}','No moves match the filter':'Ningún movimiento coincide con el filtro','No moves planned':'No hay movimientos planificados',
+ 'Queued':'En cola','Copying':'Copiando','On both disks':'En los dos discos','single':'único',
+ 'every day at {0}':'todos los días a las {0}','every {0} at {1}':'cada {0} a las {1}','day 1 of each month at {0}':'el día 1 de cada mes a las {0}',
+ 'manual runs only':'solo pasadas manuales','automatic: {0}':'automáticas: {0}','system':'sistema','No user shares found.':'No hay shares.',
+ '{0} minutes':'{0} minutos','reports in {0}':'informes en {0}',
+ 'No runs yet. Each run that moves data saves a report here.':'Todavía no hay pasadas. Cada pasada que mueve datos guarda aquí un informe.',
+ 'check log':'revisar log','completed':'completa','stopped':'parada','Automatic':'Automática','Manual':'Manual','{0} out of band':'{0} fuera de banda','{0} skipped':'{0} saltados',
+ 'Saved. New runs use these settings.':'Guardado. Las próximas pasadas usan estos ajustes.','Could not save':'No se pudo guardar',
+}};
+function T(s,...a){const t=(DICT[LANG]&&DICT[LANG][s])||s;return t.replace(/\{(\d)\}/g,(m,i)=>a[i])}
+function translateStatic(root){
+  if(!DICT[LANG]) return;
+  const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT); const nodes=[]; while(w.nextNode()) nodes.push(w.currentNode);
+  for(const n of nodes){const k=n.nodeValue.trim(); if(k&&DICT[LANG][k]) n.nodeValue=n.nodeValue.replace(k,DICT[LANG][k])}
+  root.querySelectorAll('[placeholder],[aria-label]').forEach(el=>{for(const at of ['placeholder','aria-label']){const v=el.getAttribute(at); if(v&&DICT[LANG][v]) el.setAttribute(at,DICT[LANG][v])}});
+}
+
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function fmtKB(kb){kb=+kb||0;const u=['KB','MB','GB','TB'];let i=0;while(kb>=1024&&i<3){kb/=1024;i++}return (i>=2?kb.toFixed(2):Math.round(kb))+' '+u[i]}
+const N=n=>(+n||0).toLocaleString(LANG);
+function fmtKB(kb){kb=+kb||0;const u=['KB','MB','GB','TB'];let i=0;while(kb>=1024&&i<3){kb/=1024;i++}return (i>=2?kb.toLocaleString(LANG,{minimumFractionDigits:2,maximumFractionDigits:2}):Math.round(kb))+' '+u[i]}
 function fmtDur(s){s=Math.max(0,Math.round(s||0));const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?`${h} h ${String(m).padStart(2,'0')}`:m?`${m} min`:`${s} s`}
-const when=t=>t?new Date(t*1000).toLocaleString([], {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'–';
+const when=t=>t?new Date(t*1000).toLocaleString(LANG,{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'–';
 const SKIP={partial:'partial download (.!qB, .part…)',recent:'changed too recently',open_write:'open for writing',links_outside:'a link lives outside the scanned shares'};
 
 function post(data){
@@ -363,7 +449,7 @@ function roleOf(d,target,tol){ if(d.excluded) return 'off'; return d.pct>target+
 
 function renderDisks(){
   const disks=D.live_disks||[], target=D.live_target_pct, tol=+D.tolerance||2;
-  if(!disks.length){$('hlb-disks').innerHTML='<div class="empty">No array disks are mounted. Start the array to see them.</div>';return}
+  if(!disks.length){$('hlb-disks').innerHTML=`<div class="empty">${T('No array disks are mounted. Start the array to see them.')}</div>`;return}
   // Projected fill after the plan: snapshot the plan was made from + flows
   const delta={}; (D.flows||[]).forEach(f=>{delta[f.src]=(delta[f.src]||0)-f.size_kb; delta[f.dst]=(delta[f.dst]||0)+f.size_kb});
   const base={}; (D.disks||[]).forEach(d=>base[d.name]=d);
@@ -378,14 +464,14 @@ function renderDisks(){
     let after=null;
     if(showPlan && delta[d.name] && base[d.name]) after=(base[d.name].used_kb+delta[d.name])*100/base[d.name].size_kb;
     html+=`<div class="disk ${r==='off'?'excluded':''}">
-      <div class="dname"><b>${esc(d.name)} <span class="pill ${lbl[0]}">${lbl[1]}</span></b><span>${esc(d.fsType)} · ${fmtKB(d.size_kb)}${d.temp?' · '+esc(d.temp):''}${d.spun_down?' · spun down':''}</span></div>
-      <div class="bar" role="img" aria-label="${esc(d.name)} ${d.pct} percent full, target ${target}">
+      <div class="dname"><b>${esc(d.name)} <span class="pill ${lbl[0]}">${T(lbl[1])}</span></b><span>${esc(d.fsType)} · ${fmtKB(d.size_kb)}${d.temp?' · '+esc(d.temp):''}${d.spun_down?' · '+T('spun down'):''}</span></div>
+      <div class="bar" role="img" aria-label="${esc(d.name)} ${d.pct} %, ${T('Target fill')} ${target} %">
         <div class="band" style="left:${X(target-tol)}%;width:${X(target+tol)-X(target-tol)}%"></div>
         <div class="fill" style="width:${X(d.pct)}%;background:${color}"></div>
         ${after!==null?`<div class="ghost" style="width:${X(after)}%"></div>`:''}
         <div class="target" style="left:calc(${X(target)}% - 1px)"></div>
       </div>
-      <div class="dstat"><b>${d.pct} %</b>${after!==null?` → ${Math.round(after)} %`:''}<br><span style="color:var(--muted)">${fmtKB(d.free_kb)} free</span></div>
+      <div class="dstat"><b>${d.pct} %</b>${after!==null?` → ${Math.round(after)} %`:''}<br><span style="color:var(--muted)">${T('{0} free',fmtKB(d.free_kb))}</span></div>
     </div>`;
   }
   const ticks=[]; for(let v=lo; v<=hi; v+=(hi-lo>40?20:10)) ticks.push(v);
@@ -395,125 +481,118 @@ function renderDisks(){
   const act=disks.filter(d=>!d.excluded);
   if(act.length){
     const a=act.reduce((m,d)=>d.pct>m.pct?d:m), b=act.reduce((m,d)=>d.pct<m.pct?d:m);
-    $('k-spread').innerHTML=`${a.pct-b.pct}<small>pts</small>`; $('k-spread-d').textContent=`${a.name} ${a.pct} % · ${b.name} ${b.pct} %`;
+    $('k-spread').innerHTML=`${a.pct-b.pct}<small>${T('pts')}</small>`; $('k-spread-d').textContent=`${a.name} ${a.pct} % · ${b.name} ${b.pct} %`;
     const s=act.filter(d=>roleOf(d,target,tol)==='src').length, t=act.filter(d=>roleOf(d,target,tol)==='dst').length;
-    $('k-out').innerHTML=`${s+t}<small>/ ${act.length}</small>`; $('k-out-d').textContent=`${s} source · ${t} destination`;
+    $('k-out').innerHTML=`${s+t}<small>/ ${act.length}</small>`; $('k-out-d').textContent=T('{0} source · {1} destination',s,t);
   }
   $('k-target').innerHTML=`${target}<small>%</small>`; $('k-tol').textContent=tol;
 }
 
 function renderSummary(){
   const st=D.state, s=D.stats||{};
-  const T={idle:'Idle',starting:'Starting',planning:'Planning',planned:'Plan ready',running:'Moving',completed:'Finished',stopped:'Stopped',error:'Error'};
-  $('hlb-state').dataset.s=st; $('hlb-state-t').textContent=T[st]||st;
-  let d='Ready. Simulate first to see what would move.';
-  if(st==='planning') d=`Scanning ${D.current_disk||''} (${D.source_idx||1} of ${D.source_total||1} source disks)`;
-  if(st==='planned') d=D.dry_run?'Simulation finished · nothing was moved':'Plan ready';
-  if(st==='running') d=`Started ${when(D.started_at)} · ${fmtDur(D.elapsed_sec)} elapsed`;
-  if(st==='completed') d=D.plan_count?`${fmtKB(s.bytes_done_kb)} moved · ${s.files_skipped||0} skipped`:(D.note||'Every disk is inside the band');
-  if(st==='stopped') d=`Stopped after ${fmtKB(s.bytes_done_kb||0)} · sources untouched`;
-  if(st==='error') d=D.msg||'The engine reported an error';
+  const ST={idle:'Idle',starting:'Starting',planning:'Planning',planned:'Plan ready',running:'Moving',completed:'Finished',stopped:'Stopped',error:'Error'};
+  $('hlb-state').dataset.s=st; $('hlb-state-t').textContent=T(ST[st]||st);
+  let d=T('Ready. Simulate first to see what would move.');
+  if(st==='planning') d=T('Scanning {0} ({1} of {2} source disks)',D.current_disk||'',D.source_idx||1,D.source_total||1);
+  if(st==='planned') d=D.dry_run?T('Simulation finished · nothing was moved'):T('Plan ready');
+  if(st==='running') d=T('Started {0} · {1} elapsed',when(D.started_at),fmtDur(D.elapsed_sec));
+  if(st==='completed') d=D.plan_count?T('{0} moved · {1} skipped',fmtKB(s.bytes_done_kb),s.files_skipped||0):T('Every disk is inside the band');
+  if(st==='stopped') d=T('Stopped after {0} · sources untouched',fmtKB(s.bytes_done_kb||0));
+  if(st==='error') d=D.msg||T('The engine reported an error');
   $('hlb-state-d').textContent=d;
   const planned=s.bytes_total_kb||0;
   $('k-plan').innerHTML=planned?`${fmtKB(planned).replace(/ (\w+)$/,'<small>$1</small>')}`:'–';
-  $('k-plan-d').textContent=planned?`${(D.plan_count||0).toLocaleString()} groups · ${fmtKB(s.multi_linked_kb||0)} hardlinked`:'run Simulate to plan';
+  $('k-plan-d').textContent=planned?T('{0} groups · {1} hardlinked',N(D.plan_count),fmtKB(s.multi_linked_kb||0)):T('run Simulate to plan');
   const busy=D.running;
   $('hlb-run').hidden=busy; $('hlb-plan').hidden=busy; $('hlb-stop').hidden=!busy;
   $('hlb-clear').hidden=busy||!['completed','stopped','planned','error'].includes(st);
   const g=D.guards||{}, block=g.parity||g.mover||g.rsync;
   $('hlb-run').disabled=!!block;
-  if(block && !busy) banner('warn',`Run is paused: ${block}. Simulate still works.`);
-  else if(st==='error') banner('err',D.msg||'Error');
-  else if(st==='completed' && (s.files_skipped||0)>0) banner('warn',`${s.files_skipped} groups were skipped. The log says why; nothing was lost.`);
+  if(block && !busy) banner('warn',T('Run is paused: {0}. Simulate still works.',block));
+  else if(st==='error') banner('err',D.msg||T('Error'));
+  else if(st==='completed' && (s.files_skipped||0)>0) banner('warn',T('{0} groups were skipped. The log says why; nothing was lost.',s.files_skipped));
   else banner('',null);
 }
 
 function renderRun(){
   const st=D.state, s=D.stats||{}, el=$('hlb-runbox'), pill=$('hlb-run-pill');
-  const set=(c,t)=>{pill.className='pill '+c; pill.textContent=t};
+  const set=(c,t)=>{pill.className='pill '+c; pill.textContent=T(t)};
+  const mini=(k,v)=>`<div class="mini"><div class="eyebrow">${T(k)}</div><div class="kv num">${v}</div></div>`;
   if(st==='running'){
     const cur=D.current||{}; if(cur.rate_mbs) rates.push(cur.rate_mbs); rates=rates.slice(-30);
     set('p-warn','Moving');
     const rate=(s.rate_kbs||0)/1024, p=s.pct_done||0;
     const max=Math.max(...rates,1), pts=rates.map((v,i)=>`${(rates.length>1?i/(rates.length-1)*300:300).toFixed(1)},${(50-v/max*42).toFixed(1)}`).join(' ');
     const last=(pts.split(' ').pop()||'300,50').split(',');
-    el.innerHTML=`<div class="big"><span class="kv num">${fmtKB(s.bytes_done_kb)}</span><span class="sub">of ${fmtKB(s.bytes_total_kb)} · ${Math.round(p)} %</span></div>
+    el.innerHTML=`<div class="big"><span class="kv num">${fmtKB(s.bytes_done_kb)}</span><span class="sub">${T('of {0} · {1} %',fmtKB(s.bytes_total_kb),Math.round(p))}</span></div>
       <div class="prog" role="progressbar" aria-valuenow="${Math.round(p)}" aria-valuemin="0" aria-valuemax="100"><i style="width:${p}%"></i></div>
-      <div class="sub num">Group ${(s.files_done||0)+(s.files_skipped||0)} of ${s.files_total||0} · ${s.files_skipped||0} skipped</div>
-      <div class="minis">
-        <div class="mini"><div class="eyebrow">Speed</div><div class="kv num">${Math.round(rate)}<small>MB/s</small></div></div>
-        <div class="mini"><div class="eyebrow">Time left</div><div class="kv num">${s.eta_sec?fmtDur(s.eta_sec):'–'}</div></div>
-        <div class="mini"><div class="eyebrow">Hardlinked groups</div><div class="kv num">${s.multi_linked_groups||0}</div></div>
-      </div>
-      ${rates.length>1?`<svg class="spark" viewBox="0 0 300 56" preserveAspectRatio="none" aria-label="Copy speed of recent groups"><line x1="0" y1="50" x2="300" y2="50" stroke="var(--line)"/><polygon points="0,50 ${pts} 300,50" fill="var(--band)"/><polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.6" vector-effect="non-scaling-stroke"/><circle cx="${last[0]}" cy="${last[1]}" r="3" fill="var(--accent)"/></svg>`:''}
-      ${cur.rel_path?`<div class="current"><span class="eyebrow">Copying now · ${esc(cur.src_disk)} → ${esc(cur.dst_disk)}${cur.n_paths>1?` · ${cur.n_paths} links`:''}</span>${esc(cur.rel_path)}</div>`:''}`;
+      <div class="sub num">${T('Group {0} of {1} · {2} skipped',N((s.files_done||0)+(s.files_skipped||0)),N(s.files_total),s.files_skipped||0)}</div>
+      <div class="minis">${mini('Speed',`${Math.round(rate)}<small>MB/s</small>`)}${mini('Time left',s.eta_sec?fmtDur(s.eta_sec):'–')}${mini('Hardlinked groups',N(s.multi_linked_groups))}</div>
+      ${rates.length>1?`<svg class="spark" viewBox="0 0 300 56" preserveAspectRatio="none" aria-label="${T('Speed')}"><line x1="0" y1="50" x2="300" y2="50" stroke="var(--line)"/><polygon points="0,50 ${pts} 300,50" fill="var(--band)"/><polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.6" vector-effect="non-scaling-stroke"/><circle cx="${last[0]}" cy="${last[1]}" r="3" fill="var(--accent)"/></svg>`:''}
+      ${cur.rel_path?`<div class="current"><span class="eyebrow">${T('Copying now')} · ${esc(cur.src_disk)} → ${esc(cur.dst_disk)}${cur.n_paths>1?' · '+T('{0} links',cur.n_paths):''}</span>${esc(cur.rel_path)}</div>`:''}`;
     return;
   }
   rates=[];
-  if(st==='planning'||st==='starting'){ set('p-warn','Planning'); el.innerHTML=`<div class="big"><span class="kv">Scanning…</span></div><p class="sub">Reading ${esc(D.current_disk||'the source disks')} and grouping files by inode. Large disks take a few seconds each.</p>`; return }
+  if(st==='planning'||st==='starting'){ set('p-warn','Planning'); el.innerHTML=`<div class="big"><span class="kv">${T('Scanning…')}</span></div><p class="sub">${T('Reading {0} and grouping files by inode. Large disks take a few seconds each.',esc(D.current_disk||T('the source disks')))}</p>`; return }
   if(st==='planned'){
     set('p-warn',D.dry_run?'Simulation':'Planned');
     const lim=+D.settings.LIMIT_GB||0, runs=lim?Math.ceil((s.bytes_total_kb||0)/1048576/lim):1;
-    el.innerHTML=`<div class="big"><span class="kv num">${fmtKB(s.bytes_total_kb)}</span><span class="sub">in ${(D.plan_count||0).toLocaleString()} groups</span></div>
-      <p class="sub">Nothing has moved yet. Press Run to apply this plan; every group is re-checked right before it moves.</p>
-      <div class="minis"><div class="mini"><div class="eyebrow">Runs needed</div><div class="kv num">${runs}</div></div>
-      <div class="mini"><div class="eyebrow">Hardlinked</div><div class="kv num">${s.bytes_total_kb?Math.round((s.multi_linked_kb||0)*100/s.bytes_total_kb):0} %</div></div>
-      <div class="mini"><div class="eyebrow">Routes</div><div class="kv num">${(D.flows||[]).length}</div></div></div>`;
+    el.innerHTML=`<div class="big"><span class="kv num">${fmtKB(s.bytes_total_kb)}</span><span class="sub">${T('in {0} groups',N(D.plan_count))}</span></div>
+      <p class="sub">${T('Nothing has moved yet. Press Run to apply this plan; every group is re-checked right before it moves.')}</p>
+      <div class="minis">${mini('Runs needed',runs)}${mini('Hardlinked',(s.bytes_total_kb?Math.round((s.multi_linked_kb||0)*100/s.bytes_total_kb):0)+' %')}${mini('Routes',(D.flows||[]).length)}</div>`;
     return;
   }
   if(st==='completed'||st==='stopped'){
     set(st==='completed'?'p-ok':'p-warn',st==='completed'?'Finished':'Stopped');
-    el.innerHTML=`<div class="big"><span class="kv num">${fmtKB(s.bytes_done_kb||0)}</span><span class="sub">moved in ${fmtDur(D.elapsed_sec)}</span></div>
-      <div class="minis"><div class="mini"><div class="eyebrow">Groups moved</div><div class="kv num">${s.files_done||0}</div></div>
-      <div class="mini"><div class="eyebrow">Skipped</div><div class="kv num">${s.files_skipped||0}</div></div>
-      <div class="mini"><div class="eyebrow">Avg speed</div><div class="kv num">${Math.round((s.rate_kbs||0)/1024)}<small>MB/s</small></div></div></div>`;
+    el.innerHTML=`<div class="big"><span class="kv num">${fmtKB(s.bytes_done_kb||0)}</span><span class="sub">${T('moved in {0}',fmtDur(D.elapsed_sec))}</span></div>
+      <div class="minis">${mini('Groups moved',N(s.files_done))}${mini('Skipped',N(s.files_skipped))}${mini('Avg speed',`${Math.round((s.rate_kbs||0)/1024)}<small>MB/s</small>`)}</div>`;
     return;
   }
   set('p-off','Idle');
   const h=(D.history||[])[0], sc=D.settings.SCHEDULE;
-  el.innerHTML=`<div class="big"><span class="kv">No run in progress</span></div>
-    <p class="sub">${sc&&sc!=='off'?`Automatic runs: ${schedText(D.settings)}.`:'Automatic runs are off. You can turn them on in Settings.'}</p>
-    ${h?`<div class="minis"><div class="mini"><div class="eyebrow">Last run</div><div class="kv num">${when(h.started_at).split(',')[0]}</div></div><div class="mini"><div class="eyebrow">Moved</div><div class="kv num">${fmtKB(h.moved_kb)}</div></div><div class="mini"><div class="eyebrow">Problems</div><div class="kv num">${h.partial||0}</div></div></div>`:''}`;
+  el.innerHTML=`<div class="big"><span class="kv">${T('No run in progress')}</span></div>
+    <p class="sub">${sc&&sc!=='off'?T('Automatic runs: {0}.',schedText(D.settings)):T('Automatic runs are off. You can turn them on in Settings.')}</p>
+    ${h?`<div class="minis">${mini('Last run',when(h.started_at).split(',')[0])}${mini('Moved',fmtKB(h.moved_kb))}${mini('Problems',h.partial||0)}</div>`:''}`;
 }
 
 function renderFlows(){
   const f=D.flows||[], s=D.stats||{};
-  if(!f.length){$('hlb-flows').innerHTML='<div class="empty">No plan yet. Simulate shows which disk sends data where.</div>';$('hlb-flow-tot').textContent='';$('hlb-comp').hidden=true;return}
+  if(!f.length){$('hlb-flows').innerHTML=`<div class="empty">${T('No plan yet. Simulate shows which disk sends data where.')}</div>`;$('hlb-flow-tot').textContent='';$('hlb-comp').hidden=true;return}
   const max=Math.max(...f.map(x=>x.size_kb)), shown=f.slice(0,8);
   $('hlb-flows').innerHTML=shown.map(x=>`<div class="flow"><span class="from">${esc(x.src)}</span><div class="ftrack"><i style="width:${x.size_kb/max*100}%"></i></div><span class="to">${esc(x.dst)}</span><span class="num">${fmtKB(x.size_kb)}</span></div>`).join('')
-    +(f.length>8?`<div class="sub">and ${f.length-8} smaller routes</div>`:'');
-  $('hlb-flow-tot').textContent=`${f.length} routes · ${fmtKB(f.reduce((a,x)=>a+x.size_kb,0))}`;
+    +(f.length>8?`<div class="sub">${T('and {0} smaller routes',f.length-8)}</div>`:'');
+  $('hlb-flow-tot').textContent=T('{0} routes · {1}',f.length,fmtKB(f.reduce((a,x)=>a+x.size_kb,0)));
   const tot=s.bytes_total_kb||1, ml=s.multi_linked_kb||0, pc=ml*100/tot;
   $('hlb-comp').hidden=false;
   $('hlb-split').innerHTML=`<i style="width:${pc}%;background:var(--accent)"></i><i style="width:${100-pc}%;background:var(--muted);opacity:.45"></i>`;
-  $('hlb-split-l').innerHTML=`<span><i style="background:var(--accent)"></i>Hardlinked · ${fmtKB(ml)} · ${s.multi_linked_groups||0} groups</span><span><i style="background:var(--muted)"></i>Single files · ${fmtKB(tot-ml)} · ${(s.files_total||0)-(s.multi_linked_groups||0)} groups</span>`;
+  $('hlb-split-l').innerHTML=`<span><i style="background:var(--accent)"></i>${T('Hardlinked · {0} · {1} groups',fmtKB(ml),N(s.multi_linked_groups))}</span><span><i style="background:var(--muted)"></i>${T('Single files · {0} · {1} groups',fmtKB(tot-ml),N((s.files_total||0)-(s.multi_linked_groups||0)))}</span>`;
 }
 
 function renderGuards(){
   const g=D.guards||{}, cfg=D.settings, shares=(cfg.SHARES||'').split(',').filter(Boolean), xd=(cfg.EXCLUDE_DISKS||'').split(',').filter(Boolean);
   const row=(ok,t,d)=>`<div class="guard ${ok?'g-ok':'g-warn'}"><span class="ic">${ok?'✓':'!'}</span><div><b>${esc(t)}</b><span>${esc(d)}</span></div></div>`;
   $('hlb-guards').innerHTML=
-    row(!g.mover,g.mover?'Mover is running':'Mover idle',g.mover?'runs wait until it finishes':'checked before and during runs')+
-    row(!g.parity,g.parity?'Parity check running':'No parity operation',g.parity?'runs wait until it finishes':'parity check or rebuild')+
-    row(!g.rsync,g.rsync?'Another copy is running':'No other array copy',g.rsync||'unBALANCE or any rsync between /mnt/disk*')+
-    row(true,'Open files are skipped','anything open for writing (downloads, imports) stays put')+
-    row(true,'Copy is on disk before delete','each copy and its folder are flushed (fsync) first')+
-    row(true,shares.length?`Only ${shares.length} share${shares.length>1?'s':''}`:'All user shares',(shares.length?shares.join(', '):'system shares excluded')+(xd.length?` · leaving ${xd.join(', ')} alone`:''));
+    row(!g.mover,T(g.mover?'Mover is running':'Mover idle'),T(g.mover?'runs wait until it finishes':'checked before and during runs'))+
+    row(!g.parity,T(g.parity?'Parity check running':'No parity operation'),T(g.parity?'runs wait until it finishes':'parity check or rebuild'))+
+    row(!g.rsync,T(g.rsync?'Another copy is running':'No other array copy'),g.rsync||T('unBALANCE or any rsync between /mnt/disk*'))+
+    row(true,T('Open files are skipped'),T('anything open for writing (downloads, imports) stays put'))+
+    row(true,T('Copy is on disk before delete'),T('each copy and its folder are flushed (fsync) first'))+
+    row(true,shares.length?T('Only {0} share(s)',shares.length):T('All user shares'),(shares.length?shares.join(', '):T('system shares excluded'))+(xd.length?T(' · leaving {0} alone',xd.join(', ')):''));
 }
 
 function renderSkipped(){
-  const sk=D.skipped||{}, keys=Object.keys(SKIP);
-  if(!D.flows && !Object.keys(sk).length){$('hlb-skipped').innerHTML='<div class="empty">Shown after a simulation or run.</div>';return}
-  $('hlb-skipped').innerHTML=keys.map(k=>`<span class="chip"><b>${sk[k]||0}</b>${SKIP[k]}</span>`).join('');
+  const sk=D.skipped||{};
+  if(!D.flows && !Object.keys(sk).length){$('hlb-skipped').innerHTML=`<div class="empty">${T('Shown after a simulation or run.')}</div>`;return}
+  $('hlb-skipped').innerHTML=Object.keys(SKIP).map(k=>`<span class="chip"><b>${sk[k]||0}</b>${T(SKIP[k])}</span>`).join('');
 }
 
 function renderRows(){
   const plan=D.plan||[], q=$('hlb-q').value.toLowerCase().trim();
-  $('hlb-plan-count').textContent=D.plan_count?`· showing ${Math.min(plan.length,D.plan_count)} of ${D.plan_count.toLocaleString()}`:'';
+  $('hlb-plan-count').textContent=D.plan_count?T('· showing {0} of {1}',N(Math.min(plan.length,D.plan_count)),N(D.plan_count)):'';
   const done=(D.stats?.files_done||0)+(D.stats?.files_skipped||0), recent={}; (D.recent||[]).forEach(r=>recent[r.index]=r.status);
   const st=D.state;
   const rows=plan.map((p,i)=>({p,i})).filter(({p})=>(filter==='all'||(filter==='links'?p.links>1:p.links<=1))&&(!q||(p.path+' '+p.src_disk+' '+p.dst_disk).toLowerCase().includes(q))).slice(0,300);
-  if(!rows.length){$('hlb-rows').innerHTML=`<tr><td colspan="5" class="sub" style="text-align:center;padding:18px">${plan.length?'No moves match the filter':'No moves planned'}</td></tr>`;return}
+  if(!rows.length){$('hlb-rows').innerHTML=`<tr><td colspan="5" class="sub" style="text-align:center;padding:18px">${T(plan.length?'No moves match the filter':'No moves planned')}</td></tr>`;return}
   $('hlb-rows').innerHTML=rows.map(({p,i})=>{
     let s=['st-wait',st==='planned'?'Planned':'Queued'];
     if(st==='running'||st==='completed'||st==='stopped'){
@@ -522,33 +601,34 @@ function renderRows(){
       if(r==='skipped') s=['st-skip','Skipped']; if(r==='partial') s=['st-skip','On both disks'];
       if(st==='running'&&i===done) s=['st-run','Copying'];
     }
-    return `<tr><td class="${s[0]}" style="white-space:nowrap;font-weight:600">${s[1]}</td><td class="path">${esc(p.path)}</td><td class="mono" style="white-space:nowrap">${esc(p.src_disk)} → ${esc(p.dst_disk)}</td><td class="r num">${fmtKB(p.size_kb)}</td><td class="r">${p.links>1?`<span class="pill p-dst">${p.links} links</span>`:'<span class="pill p-ok">single</span>'}</td></tr>`}).join('');
+    return `<tr><td class="${s[0]}" style="white-space:nowrap;font-weight:600">${T(s[1])}</td><td class="path">${esc(p.path)}</td><td class="mono" style="white-space:nowrap">${esc(p.src_disk)} → ${esc(p.dst_disk)}</td><td class="r num">${fmtKB(p.size_kb)}</td><td class="r">${p.links>1?`<span class="pill p-dst">${T('{0} links',p.links)}</span>`:`<span class="pill p-ok">${T('single')}</span>`}</td></tr>`}).join('');
 }
 
 const DOW=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
-function schedText(c){const h=String(c.SCHEDULE_HOUR).padStart(2,'0')+':00';return {daily:`every day at ${h}`,weekly:`every ${DOW[+c.SCHEDULE_DOW]} at ${h}`,monthly:`day 1 of each month at ${h}`}[c.SCHEDULE]||'off'}
+function schedText(c){const h=String(c.SCHEDULE_HOUR).padStart(2,'0')+':00';return {daily:T('every day at {0}',h),weekly:T('every {0} at {1}',T(DOW[+c.SCHEDULE_DOW]),h),monthly:T('day 1 of each month at {0}',h)}[c.SCHEDULE]||T('Off')}
 
 function renderSettings(){
-  const c=D.settings; $('hlb-sched-sum').textContent=c.SCHEDULE==='off'?'manual runs only':'automatic: '+schedText(c);
+  const c=D.settings; $('hlb-sched-sum').textContent=c.SCHEDULE==='off'?T('manual runs only'):T('automatic: {0}',schedText(c));
   if(settingsDirty) return;
   const sh=(c.SHARES||'').split(',').filter(Boolean), xd=(c.EXCLUDE_DISKS||'').split(',').filter(Boolean);
-  $('hlb-shares').innerHTML=(D.shares||[]).map(s=>`<label class="check ${s.system?'sys':''}"><input type="checkbox" data-share="${esc(s.name)}" ${sh.includes(s.name)?'checked':''}> ${esc(s.name)}${s.system?' <span class="sub">system</span>':''}</label>`).join('')||'<span class="sub">No user shares found.</span>';
+  $('hlb-shares').innerHTML=(D.shares||[]).map(s=>`<label class="check ${s.system?'sys':''}"><input type="checkbox" data-share="${esc(s.name)}" ${sh.includes(s.name)?'checked':''}> ${esc(s.name)}${s.system?` <span class="sub">${T('system')}</span>`:''}</label>`).join('')||`<span class="sub">${T('No user shares found.')}</span>`;
   $('hlb-xdisks').innerHTML=(D.live_disks||[]).map(d=>`<label class="check"><input type="checkbox" data-disk="${esc(d.name)}" ${xd.includes(d.name)?'checked':''}> ${esc(d.name)} <span class="sub">${esc(d.fsType)}</span></label>`).join('');
   $('s-tol').value=c.TOLERANCE; $('s-tol-v').textContent=`±${c.TOLERANCE} %`; $('s-min').value=c.MIN_SIZE_MB; $('s-lim').value=c.LIMIT_GB;
-  const age=$('s-age'); if(![...age.options].some(o=>o.value===String(c.MIN_AGE_MIN))) age.add(new Option(`${c.MIN_AGE_MIN} minutes`,c.MIN_AGE_MIN)); age.value=String(c.MIN_AGE_MIN);
+  const age=$('s-age'); if(![...age.options].some(o=>o.value===String(c.MIN_AGE_MIN))) age.add(new Option(T('{0} minutes',c.MIN_AGE_MIN),c.MIN_AGE_MIN)); age.value=String(c.MIN_AGE_MIN);
   $('s-head').value=c.HEADROOM_GB; $('s-sched').value=c.SCHEDULE; $('s-hour').value=c.SCHEDULE_HOUR; $('s-dow').value=c.SCHEDULE_DOW;
-  $('s-notify').checked=(c.UNRAID_NOTIFY||'yes')==='yes'; $('s-hook').value=c.WEBHOOK||'';
-  schedFields(); $('hlb-runs-dir').textContent='reports in '+c.RUNS_DIR;
+  $('s-notify').checked=(c.UNRAID_NOTIFY||'yes')==='yes'; $('s-hook').value=c.WEBHOOK||''; $('s-lang').value=c.LANGUAGE||'auto';
+  schedFields(); $('hlb-runs-dir').textContent=T('reports in {0}',c.RUNS_DIR);
 }
 function schedFields(){const v=$('s-sched').value; $('s-hour').disabled=v==='off'; $('s-dow').disabled=v!=='weekly'}
 
 function renderHistory(){
   const h=D.history||[];
-  if(!h.length){$('hlb-hist').innerHTML='<div class="empty">No runs yet. Each run that moves data saves a report here.</div>';return}
+  if(!h.length){$('hlb-hist').innerHTML=`<div class="empty">${T('No runs yet. Each run that moves data saves a report here.')}</div>`;return}
   $('hlb-hist').innerHTML=h.map(r=>{
     if(r.state==='done') r.state='completed';
-    const pill=r.state==='completed'?(r.partial?['p-warn','check log']:['p-ok','completed']):['p-warn',esc(r.state)];
-    return `<div class="hrow"><b class="mono">${when(r.started_at)}</b><span>${r.trigger==='scheduled'?'Automatic':r.trigger==='manual'?'Manual':esc(r.trigger)}${r.tolerance?` · ±${r.tolerance} %`:''} · ${fmtDur(r.elapsed_s)}</span><span class="num">${fmtKB(r.moved_kb)}</span><span class="num">${r.out_after!==null&&r.out_after!==undefined?r.out_after+' out of band':r.failed+' skipped'}</span><span class="pill ${pill[0]}" style="justify-self:end">${pill[1]}</span></div>`}).join('');
+    const pill=r.state==='completed'?(r.partial?['p-warn','check log']:['p-ok','completed']):['p-warn',r.state];
+    const trig=r.trigger==='scheduled'?T('Automatic'):r.trigger==='manual'?T('Manual'):esc(r.trigger);
+    return `<div class="hrow"><b class="mono">${when(r.started_at)}</b><span>${trig}${r.tolerance?` · ±${r.tolerance} %`:''} · ${fmtDur(r.elapsed_s)}</span><span class="num">${fmtKB(r.moved_kb)}</span><span class="num">${r.out_after!==null&&r.out_after!==undefined?T('{0} out of band',r.out_after):T('{0} skipped',r.failed)}</span><span class="pill ${pill[0]}" style="justify-self:end">${esc(T(pill[1]))}</span></div>`}).join('');
 }
 
 function render(){
@@ -559,39 +639,41 @@ function render(){
 /* ---------- polling ---------- */
 let timer=null;
 function poll(){
-  fetch(ENDPOINT+'?_='+Date.now()).then(r=>r.json()).then(d=>{D=d; render()}).catch(()=>banner('err','Lost contact with the server. Retrying…'))
+  fetch(ENDPOINT+'?_='+Date.now()).then(r=>r.json()).then(d=>{D=d; render()}).catch(()=>banner('err',T('Lost contact with the server. Retrying…')))
     .finally(()=>{clearTimeout(timer); timer=setTimeout(poll,(D&&D.running)?2000:8000)});
 }
 
 /* ---------- actions ---------- */
 function start(dry){
-  post({action:'start',dry_run:dry?1:''}).then(r=>{ if(!r.success) banner('err',r.msg||'Could not start'); poll() });
+  post({action:'start',dry_run:dry?1:''}).then(r=>{ if(!r.success) banner('err',r.msg||T('Could not start')); poll() });
 }
 $('hlb-plan').onclick=()=>start(true);
 $('hlb-run').onclick=()=>{
   const b=$('hlb-run');
   if(!b.classList.contains('confirm')){
-    b.classList.add('confirm'); b.textContent='Confirm: move data';
-    confirmTimer=setTimeout(()=>{b.classList.remove('confirm'); b.textContent='Run'},5000); return;
+    b.classList.add('confirm'); b.textContent=T('Confirm: move data');
+    confirmTimer=setTimeout(()=>{b.classList.remove('confirm'); b.textContent=T('Run')},5000); return;
   }
-  clearTimeout(confirmTimer); b.classList.remove('confirm'); b.textContent='Run'; start(false);
+  clearTimeout(confirmTimer); b.classList.remove('confirm'); b.textContent=T('Run'); start(false);
 };
 $('hlb-stop').onclick=()=>post({action:'stop'}).then(poll);
 $('hlb-clear').onclick=()=>post({action:'clear'}).then(poll);
 document.querySelectorAll('#hlb .chipbtn').forEach(b=>b.onclick=()=>{filter=b.dataset.f;document.querySelectorAll('#hlb .chipbtn').forEach(x=>x.setAttribute('aria-pressed',x===b));if(D)renderRows()});
 $('hlb-q').oninput=()=>D&&renderRows();
-$('hlb-copy').onclick=e=>{e.preventDefault();const t=$('hlb-log').textContent;(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>{e.target.textContent='Copied'},()=>{const r=document.createRange();r.selectNodeContents($('hlb-log'));getSelection().removeAllRanges();getSelection().addRange(r)}).finally(()=>setTimeout(()=>e.target.textContent='Copy log',1500))};
+$('hlb-copy').onclick=e=>{e.preventDefault();const t=$('hlb-log').textContent;(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>{e.target.textContent=T('Copied')},()=>{const r=document.createRange();r.selectNodeContents($('hlb-log'));getSelection().removeAllRanges();getSelection().addRange(r)}).finally(()=>setTimeout(()=>e.target.textContent=T('Copy log'),1500))};
 for(let h=0;h<24;h++) $('s-hour').add(new Option(String(h).padStart(2,'0')+':00',h));
 $('hlb-settings').addEventListener('input',e=>{settingsDirty=true; if(e.target.id==='s-tol') $('s-tol-v').textContent=`±${e.target.value} %`; if(e.target.id==='s-sched') schedFields()});
 $('hlb-settings').addEventListener('change',()=>{settingsDirty=true; schedFields()});
 $('hlb-save').onclick=()=>{
   const shares=[...document.querySelectorAll('#hlb-shares input:checked')].map(i=>i.dataset.share).join(',');
   const xd=[...document.querySelectorAll('#hlb-xdisks input:checked')].map(i=>i.dataset.disk).join(',');
+  const langChanged=$('s-lang').value!==(D.settings.LANGUAGE||'auto');
   post({action:'save_settings',shares,exclude_disks:xd,tolerance:$('s-tol').value,min_size_mb:$('s-min').value,limit_gb:$('s-lim').value,
     min_age_min:$('s-age').value,headroom_gb:$('s-head').value,schedule:$('s-sched').value,schedule_hour:$('s-hour').value,
-    schedule_dow:$('s-dow').value,unraid_notify:$('s-notify').checked?1:'',webhook:$('s-hook').value.trim()})
-  .then(r=>{$('hlb-save-msg').textContent=r.success?'Saved. New runs use these settings.':(r.msg||'Could not save'); if(r.success){settingsDirty=false; poll()}});
+    schedule_dow:$('s-dow').value,unraid_notify:$('s-notify').checked?1:'',webhook:$('s-hook').value.trim(),language:$('s-lang').value})
+  .then(r=>{$('hlb-save-msg').textContent=r.success?T('Saved. New runs use these settings.'):(r.msg||T('Could not save')); if(r.success){settingsDirty=false; if(langChanged) location.reload(); else poll()}});
 };
+translateStatic($('hlb'));
 poll();
 })();
 </script>

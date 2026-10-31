@@ -41,7 +41,15 @@ disk3: media/Movie.mkv      (copy 2)         disk3: media/Movie.mkv   ──┘ 
 
 ![Settings](docs/screenshots/settings_dark.png)
 
-The page follows your Unraid theme (dark for Black and Gray, light for White and Azure).
+The page follows your Unraid theme (dark for Black and Gray, light for White and Azure) and your Unraid language.
+
+## Languages
+
+English and Spanish. By default the page uses the language set in **Settings → Display Settings**; you can force one under **Settings → Language** in EquiLink. Unknown languages fall back to English.
+
+To add a language, copy the `es` block of `DICT` in `HardlinkBalance.page`, translate the right-hand side and add the code to the language list. Pull requests welcome.
+
+![Spanish](docs/screenshots/plan_es.png)
 
 ## What you get
 
@@ -118,6 +126,7 @@ Everything is set from the page and saved to `/boot/config/plugins/hardlink-bala
 | `LIMIT_GB` | `0` | Maximum data per run. `0` = no cap. |
 | `MIN_AGE_MIN` | `60` | Leave folders changed in the last N minutes. |
 | `HEADROOM_GB` | `10` | Free space always left on a destination disk. |
+| `LANGUAGE` | `auto` | `auto` (same as Unraid), `en` or `es`. |
 | `SCHEDULE` | `off` | `off`, `daily`, `weekly` or `monthly`. |
 | `SCHEDULE_HOUR` / `SCHEDULE_DOW` | `3` / `0` | Hour of automatic runs; weekday for weekly runs (0 = Sunday). |
 | `UNRAID_NOTIFY` | `yes` | Send a notification to the Unraid bell when a run ends. |
