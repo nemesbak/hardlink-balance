@@ -638,7 +638,33 @@ def build_plan(disks, tolerance, min_size_kb, min_age_s, limit_kb=None, run_star
                 d["free_kb"] -= delta
                 d["pct"] = d["used_kb"] * 100 // d["size_kb"]
 
-    return plan, disks, target_pct
+    return interleave_by_source(plan), disks, target_pct
+
+
+def interleave_by_source(plan):
+    """Reorder the plan so every source disk progresses at the same pace (by bytes).
+    Built source by source, the last disk would be left alone at the end and parallel
+    copies would drop to one. Each source keeps its own order (oldest first) and the
+    groups of one folder stay together."""
+    queues, totals = {}, {}
+    for g in plan:
+        queues.setdefault(g["src_disk"], []).append(g)
+        totals[g["src_disk"]] = totals.get(g["src_disk"], 0) + g["size_kb"]
+    if len(queues) < 2:
+        return plan
+    done = dict.fromkeys(queues, 0)
+    out = []
+    while queues:
+        src = min(queues, key=lambda n: (done[n] / totals[n]) if totals[n] else 1)
+        q = queues[src]
+        folder = os.path.dirname(q[0]["paths"][0])
+        while q and os.path.dirname(q[0]["paths"][0]) == folder:
+            g = q.pop(0)
+            done[src] += g["size_kb"]
+            out.append(g)
+        if not q:
+            del queues[src]
+    return out
 
 
 def _build_disks_list(disks, target_pct, tolerance):
