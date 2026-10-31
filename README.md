@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://unraid.net"><img src="https://img.shields.io/badge/Unraid-6.12%2B%20%7C%207.x-orange.svg" alt="Unraid 6.12+ and 7.x"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT license"></a>
-  <img src="https://img.shields.io/badge/version-2026.10.31d-c4621d.svg" alt="Version 2026.10.31d">
+  <img src="https://img.shields.io/badge/version-2026.10.31e-c4621d.svg" alt="Version 2026.10.31e">
   <img src="https://img.shields.io/badge/tests-34%20passing-3a8a3f.svg" alt="34 tests passing">
 </p>
 

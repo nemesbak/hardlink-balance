@@ -2,8 +2,8 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name       "hardlink-balance">
   <!ENTITY author     "nemes">
-  <!ENTITY version    "2026.10.31d">
-  <!ENTITY commit     "2eb69c77c4e2e51762b6ece1491de87728b9b322">
+  <!ENTITY version    "2026.10.31e">
+  <!ENTITY commit     "af17d858608b9bae89bcb01c57634628ccef1556">
   <!ENTITY raw        "https://raw.githubusercontent.com/&github;/&commit;">
   <!ENTITY github     "nemesbak/hardlink-balance">
   <!ENTITY pluginURL  "https://raw.githubusercontent.com/&github;/main/hardlink-balance.plg">
@@ -22,6 +22,9 @@
 >
 
 <CHANGES>
+##2026.10.31e
+- The plan alternates between source disks, so all of them progress at the same pace (a run stopped early or capped by the limit leaves every disk partly done).
+
 ##2026.10.31d
 - Disks below the target band now count: disks above the target keep giving data until no disk sits under the band.
 - Planning uses exact fill instead of whole percents.
@@ -87,7 +90,7 @@ mkdir -p &bootDir;/runs
 
 <FILE Name="&bootDir;/scripts/hardlink_balance.py">
 <URL>&raw;/scripts/hardlink_balance.py</URL>
-<MD5>d6cc7b664b550bd65eaa4a5d4f3acd3e</MD5>
+<MD5>bc1d81189c1a5145d742a1b856d29d26</MD5>
 </FILE>
 
 <FILE Name="&bootDir;/scripts/status.php">
