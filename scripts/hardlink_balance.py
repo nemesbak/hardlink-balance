@@ -25,6 +25,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict
 
@@ -50,10 +51,13 @@ CFG = {
     "MIN_SIZE_MB": "100",
     "LIMIT_GB": "0",                                 # 0 = no cap
     "HEADROOM_GB": "10",                             # free space always left on a destination
+    "PARALLEL": "1",                                 # copies at once; each disk takes part in one copy only
 }
 
 # Extra fields merged into every status write (plan flows, skipped counters) for the WebGUI
 STATUS_EXTRA = {}
+
+MNT_ROOT = "/mnt"                    # where diskN mounts live (tests use a fake root)
 
 # Shares/directories that should never be rebalanced automatically
 DEFAULT_EXCLUDE_DIRS = {
@@ -310,6 +314,32 @@ def _mover_running():
     return bool(r.stdout.strip())
 
 
+def _ppid(pid):
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            return next(int(l.split()[1]) for l in f if l.startswith("PPid:"))
+    except (OSError, StopIteration, ValueError):
+        return 0
+
+
+def _is_ours(pid):
+    """True if pid descends from this engine (local rsync forks sender/receiver children)."""
+    me, seen = {os.getpid()}, 0
+    try:                                # --guards runs as a separate process: the engine is in the lock
+        with open(LOCK_FILE) as f:
+            lp = int(f.read().strip())
+        if pid_is_us(lp):
+            me.add(lp)
+    except (OSError, ValueError):
+        pass
+    while pid > 1 and seen < 32:
+        pid = _ppid(pid)
+        if pid in me:
+            return True
+        seen += 1
+    return False
+
+
 def _foreign_rsync():
     # unBALANCE's daemon is always up; it is only busy while one of its rsyncs runs.
     # Same for any other tool copying between array disks.
@@ -318,11 +348,9 @@ def _foreign_rsync():
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as f:
                 cmd = f.read().replace(bytes([0]), b" ").decode(errors="replace")
-            with open(f"/proc/{pid}/status") as f:
-                ppid = next(int(l.split()[1]) for l in f if l.startswith("PPid:"))
-        except (OSError, StopIteration):
+        except OSError:
             continue
-        if ppid != os.getpid() and "/mnt/disk" in cmd:
+        if f"{MNT_ROOT}/disk" in cmd and not _is_ours(int(pid)):
             return "another rsync is moving data between array disks (unBALANCE?)"
     return ""
 
@@ -559,6 +587,8 @@ def build_plan(disks, tolerance, min_size_kb, min_age_s, limit_kb=None, run_star
                 limit_hit = True
                 break
             size_kb = u["size_kb"]
+            if limit_kb is not None and plan_total_kb + size_kb > limit_kb:
+                continue            # this folder would overshoot the cap; a smaller one may still fit
             # Don't overshoot the source below the band
             if pct_with(s, -size_kb) < target_pct - tolerance:
                 continue
@@ -718,12 +748,20 @@ def execute_group(group, disks):
     makedirs_nobody(os.path.dirname(dst_primary))
     tmp = os.path.join(os.path.dirname(dst_primary), "." + os.path.basename(dst_primary) + TMP_SUFFIX)
 
-    proc = subprocess.Popen(["rsync", "-aX", primary, tmp],
+    # Own session: Stop can end rsync together with the children it forks
+    proc = subprocess.Popen(["rsync", "-aX", primary, tmp], start_new_session=True,
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     while proc.poll() is None:
         if _STOP:
-            proc.terminate()
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                proc.terminate()
             proc.wait()
+            for _ in range(25):             # receiver child may still be closing the temp file
+                if subprocess.run(["pgrep", "-s", str(proc.pid)], capture_output=True).returncode:
+                    break
+                time.sleep(0.2)
             _rm([tmp])
             log(f"  ABORTED copy of {rel_primary} (stop requested, source untouched)")
             return "skipped", rel_primary
@@ -797,6 +835,7 @@ def main():
     ap.add_argument("--min-age-min", type=int, default=None, help="skip folders touched in the last N minutes")
     ap.add_argument("--limit-gb", type=float, default=None, help="cap total plan size (for a safe test run)")
     ap.add_argument("--exclude-disks", type=str, default=None, help="comma-separated disk names to exclude (e.g. disk8)")
+    ap.add_argument("--parallel", type=int, default=None, help="copies at once, never two on the same disk (default from settings: 1)")
     ap.add_argument("--guards", action="store_true", help="print the safety-check state as JSON and exit")
     ap.add_argument("--mnt-root", type=str, default="/mnt", help=argparse.SUPPRESS)  # tests
     ap.add_argument("--cfg-file", type=str, default=None, help=argparse.SUPPRESS)  # tests
@@ -810,6 +849,8 @@ def main():
         global CFG_FILE
         CFG_FILE = args.cfg_file
     load_cfg()
+    global MNT_ROOT
+    MNT_ROOT = args.mnt_root.rstrip("/") or "/mnt"
     if args.guards:
         print(json.dumps(guards()))
         return
@@ -822,6 +863,9 @@ def main():
         args.limit_gb = num("LIMIT_GB", 0)
     if args.exclude_disks is None:
         args.exclude_disks = CFG.get("EXCLUDE_DISKS", "")
+    if args.parallel is None:
+        args.parallel = int(num("PARALLEL", 1))
+    args.parallel = max(1, min(8, args.parallel))
     global MIN_FREE_HEADROOM_KB
     MIN_FREE_HEADROOM_KB = int(num("HEADROOM_GB", 10) * 1024 * 1024)
     if args.shares_cfg_dir:
@@ -947,7 +991,7 @@ def main():
 
         for name in disks:                  # leftovers of a crash may sit on any disk
             clean_stale_temps(disks[name]["mount"])
-        log("EXECUTING plan...")
+        log(f"EXECUTING plan... ({args.parallel} cop{'y' if args.parallel == 1 else 'ies'} at once, never two on the same disk)")
         done = 0
         failed = 0
         partial = 0
@@ -957,48 +1001,19 @@ def main():
         stopped_early = False
         stop_reason = ""
 
-        for i, group in enumerate(plan):
-            if not _STOP and i % 25 == 0:
-                stop_reason = array_busy()
-            if _STOP or stop_reason:
-                log(f"Halting: {stop_reason or 'stop signal received'} (in-flight copy cleaned, sources untouched).")
-                stopped_early = True
-                break
+        # Scheduler: a group starts only when both its disks are free, so every disk
+        # takes part in at most one copy. Plan order is kept as far as disks allow.
+        cv = threading.Condition()
+        pending = list(enumerate(plan))
+        busy_disks = set()
+        active = {}                      # thread name -> current group info
+        started = 0
 
-            t0 = time.time()
-            status, rel_primary = execute_group(group, disks)
-            if _STOP and status == "skipped":
-                stopped_early = True
-            elapsed = max(0.001, time.time() - t0)
-            rate_mbs = (group["size_kb"] / 1024) / elapsed
-            ok = status == "ok"
-
-            results.append({
-                "index": i,
-                "src_disk": group["src_disk"],
-                "dst_disk": group["dst_disk"],
-                "size_kb": group["size_kb"],
-                "n_paths": len(group["paths"]),
-                "rel_path": rel_primary,
-                "ok": ok,
-                "status": status,
-                "elapsed_s": round(elapsed, 2),
-                "rate_mbs": round(rate_mbs, 1),
-            })
-
-            if ok:
-                done += 1
-                freed_kb += group["size_kb"]
-            else:
-                failed += 1
-                if status == "partial":
-                    partial += 1
-
+        def write_running(last):
             elapsed_total = time.time() - run_start
             overall_rate_mbs = (freed_kb / 1024) / elapsed_total if elapsed_total > 0 else 0
-            remaining_kb = total_kb - freed_kb
-            eta_sec = int(remaining_kb / 1024 / overall_rate_mbs) if overall_rate_mbs > 0 else 0
-
+            eta_sec = int((total_kb - freed_kb) / 1024 / overall_rate_mbs) if overall_rate_mbs > 0 else 0
+            cur = list(active.values())
             write_json_atomic(STATUS_FILE, {
                 "state": "running",
                 "started_at": run_start,
@@ -1006,8 +1021,9 @@ def main():
                 "dry_run": False,
                 "target_pct": target_pct,
                 "tolerance": args.tolerance,
+                "parallel": args.parallel,
                 "elapsed_sec": int(elapsed_total),
-                "current_file": rel_primary,
+                "current_file": cur[0]["rel_path"] if cur else last.get("rel_path", ""),
                 "disks": _build_disks_list(disks, target_pct, args.tolerance),
                 "plan_count": len(plan),
                 "plan": plan_export[:100],
@@ -1023,19 +1039,94 @@ def main():
                     "multi_linked_groups": len(multi0),
                     "multi_linked_kb": multi_kb,
                 },
-                "current": {
-                    "rel_path": rel_primary,
-                    "src_disk": group["src_disk"],
-                    "dst_disk": group["dst_disk"],
-                    "n_paths": len(group["paths"]),
-                    "rate_mbs": round(rate_mbs, 1),
-                },
+                "current": cur[0] if cur else last,
+                "active": cur,
                 "recent": results[-20:],
             })
 
-            if (i + 1) % 50 == 0:
-                log(f"  progress: {i+1}/{len(plan)} groups processed "
-                    f"({fmt_kb(freed_kb)} / {fmt_kb(total_kb)}, {overall_rate_mbs:.0f} MB/s avg)")
+        def worker():
+            nonlocal done, failed, partial, freed_kb, started, stop_reason, stopped_early
+            me = threading.current_thread().name
+            while True:
+                with cv:
+                    while True:
+                        if _STOP or stop_reason or not pending:
+                            return
+                        pick = next((k for k, (_, g) in enumerate(pending)
+                                     if g["src_disk"] not in busy_disks and g["dst_disk"] not in busy_disks), None)
+                        if pick is not None:
+                            break
+                        cv.wait(1.0)
+                    i, group = pending.pop(pick)
+                    busy_disks.update((group["src_disk"], group["dst_disk"]))
+                    started += 1
+                    check_busy = started % 25 == 1
+                    active[me] = {"rel_path": rel_to_mount(group["paths"][0], disks[group["src_disk"]]["mount"]),
+                                  "src_disk": group["src_disk"], "dst_disk": group["dst_disk"],
+                                  "n_paths": len(group["paths"]), "rate_mbs": 0}
+                if check_busy:
+                    why = array_busy()
+                    if why:
+                        with cv:
+                            stop_reason = why
+                            pending.insert(0, (i, group))
+                            busy_disks.difference_update((group["src_disk"], group["dst_disk"]))
+                            active.pop(me, None)
+                            cv.notify_all()
+                        return
+
+                t0 = time.time()
+                try:
+                    status, rel_primary = execute_group(group, disks)
+                except Exception as e:          # never leave the scheduler with a disk marked busy
+                    status, rel_primary = "skipped", active.get(me, {}).get("rel_path", "?")
+                    log(f"  ERROR unexpected {type(e).__name__}: {e}")
+                elapsed = max(0.001, time.time() - t0)
+                rate_mbs = (group["size_kb"] / 1024) / elapsed
+
+                with cv:
+                    busy_disks.difference_update((group["src_disk"], group["dst_disk"]))
+                    last = dict(active.pop(me, {}), rate_mbs=round(rate_mbs, 1))
+                    if _STOP and status == "skipped":
+                        stopped_early = True
+                    ok = status == "ok"
+                    results.append({
+                        "index": i,
+                        "src_disk": group["src_disk"],
+                        "dst_disk": group["dst_disk"],
+                        "size_kb": group["size_kb"],
+                        "n_paths": len(group["paths"]),
+                        "rel_path": rel_primary,
+                        "ok": ok,
+                        "status": status,
+                        "elapsed_s": round(elapsed, 2),
+                        "rate_mbs": round(rate_mbs, 1),
+                    })
+                    if ok:
+                        done += 1
+                        freed_kb += group["size_kb"]
+                    else:
+                        failed += 1
+                        if status == "partial":
+                            partial += 1
+                    n = done + failed
+                    write_running(last)
+                    if n % 50 == 0:
+                        el = time.time() - run_start
+                        log(f"  progress: {n}/{len(plan)} groups processed "
+                            f"({fmt_kb(freed_kb)} / {fmt_kb(total_kb)}, {(freed_kb / 1024) / el if el else 0:.0f} MB/s avg)")
+                    cv.notify_all()
+
+        workers = [threading.Thread(target=worker, name=f"copy{k + 1}", daemon=True) for k in range(args.parallel)]
+        for t in workers:
+            t.start()
+        # Join with a timeout so SIGTERM (Stop button) is handled by this main thread
+        while any(t.is_alive() for t in workers):
+            for t in workers:
+                t.join(0.5)
+        if _STOP or stop_reason:
+            stopped_early = True
+            log(f"Halting: {stop_reason or 'stop signal received'} (in-flight copies cleaned, sources untouched).")
 
         elapsed_total = time.time() - run_start
         state = "stopped" if stopped_early else "completed"

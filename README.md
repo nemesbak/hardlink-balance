@@ -8,8 +8,8 @@
 <p align="center">
   <a href="https://unraid.net"><img src="https://img.shields.io/badge/Unraid-6.12%2B%20%7C%207.x-orange.svg" alt="Unraid 6.12+ and 7.x"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT license"></a>
-  <img src="https://img.shields.io/badge/version-2026.10.31b-c4621d.svg" alt="Version 2026.10.31b">
-  <img src="https://img.shields.io/badge/tests-19%20passing-3a8a3f.svg" alt="19 tests passing">
+  <img src="https://img.shields.io/badge/version-2026.10.31c-c4621d.svg" alt="Version 2026.10.31c">
+  <img src="https://img.shields.io/badge/tests-34%20passing-3a8a3f.svg" alt="34 tests passing">
 </p>
 
 ![EquiLink with a plan ready: disks, target band and projected fill](docs/screenshots/plan_dark.png)
@@ -58,6 +58,7 @@ To add a language, copy the `es` block of `DICT` in `HardlinkBalance.page`, tran
 - **Live progress.** Data moved, speed, time left, the file being copied and the status of each move.
 - **Safety checks on screen.** Mover, parity operations and other array copies are shown and re-checked during the run.
 - **History.** Every run that moved data leaves a report: when, how much, how long and whether anything needs a look.
+- **Parallel copies.** Several copies at once, each between its own pair of disks, so no disk ever reads or writes two things at the same time. On an array without parity, three copies move data about three times faster.
 - **Automatic runs.** Daily, weekly or monthly, with an optional cap per run so a big rebalance spreads over several nights.
 - **Notifications.** In the Unraid notification bell and, optionally, a webhook.
 
@@ -94,6 +95,8 @@ If anything changes on the way, the group is skipped and the source stays as it 
 | Several shares, but only some should move | Tick them under **Shares to balance**. |
 | A disk you want to keep as it is (archive, near failure, different speed) | Tick it under **Disks to leave alone**. It is not touched and does not count toward the target. |
 | Large array, short quiet hours | Set **Limit per run** (e.g. 500 GB) and **Automatic runs** at night. |
+| No parity, several disks to fill or empty | Set **Copies at once** to 2–4. Each disk still takes part in one copy at a time. |
+| Parity disk | Keep **Copies at once** at 1: every write also goes to parity, so parallel copies do not help. |
 | Downloads that take hours to import | Raise **Leave recent folders for** to 6 hours or 1 day. |
 | Small disks, or ones that fill up fast | Raise **Keep free on destination**. |
 | ZFS disks in the array | Supported. Capacity is read from the pool (`zfs list`), so child datasets such as `/mnt/disk8/data` count. |
@@ -126,6 +129,7 @@ Everything is set from the page and saved to `/boot/config/plugins/hardlink-bala
 | `LIMIT_GB` | `0` | Maximum data per run. `0` = no cap. |
 | `MIN_AGE_MIN` | `60` | Leave folders changed in the last N minutes. |
 | `HEADROOM_GB` | `10` | Free space always left on a destination disk. |
+| `PARALLEL` | `1` | Copies at once (1–4). A disk never takes part in two copies at the same time. |
 | `LANGUAGE` | `auto` | `auto` (same as Unraid), `en` or `es`. |
 | `SCHEDULE` | `off` | `off`, `daily`, `weekly` or `monthly`. |
 | `SCHEDULE_HOUR` / `SCHEDULE_DOW` | `3` / `0` | Hour of automatic runs; weekday for weekly runs (0 = Sunday). |
@@ -140,19 +144,23 @@ E=/usr/local/emhttp/plugins/hardlink-balance/scripts/hardlink_balance.py
 
 python3 $E --dry-run                        # simulate with your saved settings
 python3 $E --execute --limit-gb 50          # move at most 50 GB
+python3 $E --execute --parallel 3           # three copies at once (arrays without parity)
 python3 $E --execute --exclude-disks disk8  # leave disk8 alone this time
 python3 $E --stop                           # stop a running balance
 python3 $E --guards                         # Mover / parity / rsync state as JSON
 ```
 
-Command-line flags (`--tolerance`, `--min-size-kb`, `--min-age-min`, `--limit-gb`, `--exclude-disks`) override the saved settings for that run only.
+Command-line flags (`--tolerance`, `--min-size-kb`, `--min-age-min`, `--limit-gb`, `--exclude-disks`, `--parallel`) override the saved settings for that run only.
 
 ## Tests
 
-`tests/test_hlb.sh` builds three throwaway XFS disks in RAM and runs 19 checks: links kept, content identical, recent, open and partial files left alone, no overwrite on collision, stop in the middle of a copy, share exclusions, crash leftovers and the share filter. Run it as root on the server:
+Two suites build throwaway XFS disks in RAM and run as root on the server:
+
+- `tests/test_hlb.sh` (19 checks): links kept, content identical, recent, open and partial files left alone, no overwrite on collision, stop in the middle of a copy, share exclusions, crash leftovers and the share filter.
+- `tests/test_parallel.sh` (15 checks): real concurrency, never two copies on one disk, every torrent ↔ library pair still linked, stop with several copies in flight, the engine's own copies never mistaken for another tool's, and a foreign `rsync` between disks blocks the run.
 
 ```bash
-bash tests/test_hlb.sh
+bash tests/test_hlb.sh && bash tests/test_parallel.sh
 ```
 
 ## FAQ

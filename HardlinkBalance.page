@@ -123,7 +123,7 @@ if (!in_array($lang, ['en', 'es'], true)) $lang = strncmp((string)$uiLoc, 'es', 
 #hlb .minis{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px}
 #hlb .mini{background:var(--panel-2);border-radius:8px;padding:10px 12px;min-width:0}
 #hlb .mini .kv{font-size:18px}
-#hlb .current{margin-top:14px;font-family:var(--f-mono);font-size:12px;background:var(--panel-2);border-radius:8px;padding:10px 12px;word-break:break-all}
+#hlb .current{margin-top:10px;font-family:var(--f-mono);font-size:12px;background:var(--panel-2);border-radius:8px;padding:10px 12px;word-break:break-all}
 #hlb .current .eyebrow{display:block;margin-bottom:4px;font-family:inherit}
 #hlb svg.spark{width:100%;height:56px;display:block;margin-top:12px}
 
@@ -317,6 +317,7 @@ if (!in_array($lang, ['en', 'es'], true)) $lang = strncmp((string)$uiLoc, 'es', 
           <div class="field"><label for="s-lim">Limit per run (GB)</label><input id="s-lim" type="number" min="0" value="0"><div class="hint">0 moves everything in one run.</div></div>
           <div class="field"><label for="s-age">Leave recent folders for</label><select id="s-age"><option value="15">15 minutes</option><option value="60">1 hour</option><option value="360">6 hours</option><option value="1440">1 day</option></select><div class="hint">Protects downloads that are still being imported.</div></div>
           <div class="field"><label for="s-head">Keep free on destination (GB)</label><input id="s-head" type="number" min="1" value="10"></div>
+          <div class="field"><label for="s-par">Copies at once</label><select id="s-par"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select><div class="hint">Each disk takes part in one copy at a time. Use more than 1 when the array has no parity.</div></div>
           <div class="field"><label for="s-sched">Automatic runs</label><select id="s-sched"><option value="off">Off</option><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly (day 1)</option></select></div>
           <div class="field"><label for="s-hour">At</label><select id="s-hour"></select></div>
           <div class="field"><label for="s-dow">On</label><select id="s-dow"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option></select></div>
@@ -376,6 +377,7 @@ const DICT={es:{
  'Protects downloads that are still being imported.':'Protege las descargas que aún se están importando.',
  'Keep free on destination (GB)':'Dejar libre en destino (GB)','Automatic runs':'Pasadas automáticas','Off':'Desactivadas','Daily':'Diarias','Weekly':'Semanales','Monthly (day 1)':'Mensuales (día 1)',
  'At':'A las','On':'El','Sunday':'domingo','Monday':'lunes','Tuesday':'martes','Wednesday':'miércoles','Thursday':'jueves','Friday':'viernes','Saturday':'sábado',
+ 'Copies at once':'Copias a la vez','Each disk takes part in one copy at a time. Use more than 1 when the array has no parity.':'Cada disco participa en una sola copia a la vez. Usa más de 1 si el array no tiene paridad.',
  'Notifications':'Avisos','Unraid notification when a run ends':'Aviso de Unraid al terminar una pasada','Language':'Idioma','Same as Unraid':'El de Unraid',
  'Webhook (optional)':'Webhook (opcional)','Alertmanager-style JSON, sent when a run ends with problems or moved data.':'JSON estilo Alertmanager, enviado al terminar una pasada con problemas o datos movidos.',
  'Saved to /boot/config/plugins/hardlink-balance/hardlink-balance.cfg':'Se guarda en /boot/config/plugins/hardlink-balance/hardlink-balance.cfg',
@@ -529,7 +531,7 @@ function renderRun(){
       <div class="sub num">${T('Group {0} of {1} · {2} skipped',N((s.files_done||0)+(s.files_skipped||0)),N(s.files_total),s.files_skipped||0)}</div>
       <div class="minis">${mini('Speed',`${Math.round(rate)}<small>MB/s</small>`)}${mini('Time left',s.eta_sec?fmtDur(s.eta_sec):'–')}${mini('Hardlinked groups',N(s.multi_linked_groups))}</div>
       ${rates.length>1?`<svg class="spark" viewBox="0 0 300 56" preserveAspectRatio="none" aria-label="${T('Speed')}"><line x1="0" y1="50" x2="300" y2="50" stroke="var(--line)"/><polygon points="0,50 ${pts} 300,50" fill="var(--band)"/><polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.6" vector-effect="non-scaling-stroke"/><circle cx="${last[0]}" cy="${last[1]}" r="3" fill="var(--accent)"/></svg>`:''}
-      ${cur.rel_path?`<div class="current"><span class="eyebrow">${T('Copying now')} · ${esc(cur.src_disk)} → ${esc(cur.dst_disk)}${cur.n_paths>1?' · '+T('{0} links',cur.n_paths):''}</span>${esc(cur.rel_path)}</div>`:''}`;
+      ${(D.active&&D.active.length?D.active:(cur.rel_path?[cur]:[])).map(a=>`<div class="current"><span class="eyebrow">${T('Copying now')} · ${esc(a.src_disk)} → ${esc(a.dst_disk)}${a.n_paths>1?' · '+T('{0} links',a.n_paths):''}</span>${esc(a.rel_path)}</div>`).join('')}`;
     return;
   }
   rates=[];
@@ -615,7 +617,7 @@ function renderSettings(){
   $('hlb-xdisks').innerHTML=(D.live_disks||[]).map(d=>`<label class="check"><input type="checkbox" data-disk="${esc(d.name)}" ${xd.includes(d.name)?'checked':''}> ${esc(d.name)} <span class="sub">${esc(d.fsType)}</span></label>`).join('');
   $('s-tol').value=c.TOLERANCE; $('s-tol-v').textContent=`±${c.TOLERANCE} %`; $('s-min').value=c.MIN_SIZE_MB; $('s-lim').value=c.LIMIT_GB;
   const age=$('s-age'); if(![...age.options].some(o=>o.value===String(c.MIN_AGE_MIN))) age.add(new Option(T('{0} minutes',c.MIN_AGE_MIN),c.MIN_AGE_MIN)); age.value=String(c.MIN_AGE_MIN);
-  $('s-head').value=c.HEADROOM_GB; $('s-sched').value=c.SCHEDULE; $('s-hour').value=c.SCHEDULE_HOUR; $('s-dow').value=c.SCHEDULE_DOW;
+  $('s-head').value=c.HEADROOM_GB; $('s-par').value=String(c.PARALLEL||1); $('s-sched').value=c.SCHEDULE; $('s-hour').value=c.SCHEDULE_HOUR; $('s-dow').value=c.SCHEDULE_DOW;
   $('s-notify').checked=(c.UNRAID_NOTIFY||'yes')==='yes'; $('s-hook').value=c.WEBHOOK||''; $('s-lang').value=c.LANGUAGE||'auto';
   schedFields(); $('hlb-runs-dir').textContent=T('reports in {0}',c.RUNS_DIR);
 }
@@ -669,7 +671,7 @@ $('hlb-save').onclick=()=>{
   const xd=[...document.querySelectorAll('#hlb-xdisks input:checked')].map(i=>i.dataset.disk).join(',');
   const langChanged=$('s-lang').value!==(D.settings.LANGUAGE||'auto');
   post({action:'save_settings',shares,exclude_disks:xd,tolerance:$('s-tol').value,min_size_mb:$('s-min').value,limit_gb:$('s-lim').value,
-    min_age_min:$('s-age').value,headroom_gb:$('s-head').value,schedule:$('s-sched').value,schedule_hour:$('s-hour').value,
+    min_age_min:$('s-age').value,headroom_gb:$('s-head').value,parallel:$('s-par').value,schedule:$('s-sched').value,schedule_hour:$('s-hour').value,
     schedule_dow:$('s-dow').value,unraid_notify:$('s-notify').checked?1:'',webhook:$('s-hook').value.trim(),language:$('s-lang').value})
   .then(r=>{$('hlb-save-msg').textContent=r.success?T('Saved. New runs use these settings.'):(r.msg||T('Could not save')); if(r.success){settingsDirty=false; if(langChanged) location.reload(); else poll()}});
 };

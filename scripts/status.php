@@ -28,7 +28,7 @@ const SYSTEM_SHARES = ['system', 'appdata', 'domains', 'isos'];
 const DEFAULTS = [
     'WEBHOOK' => '', 'UNRAID_NOTIFY' => 'yes', 'RUNS_DIR' => BOOT_DIR . '/runs', 'MIN_AGE_MIN' => '60',
     'SHARES' => '', 'EXCLUDE_DISKS' => '', 'TOLERANCE' => '2', 'MIN_SIZE_MB' => '100', 'LIMIT_GB' => '0',
-    'HEADROOM_GB' => '10', 'LANGUAGE' => 'auto', 'SCHEDULE' => 'off', 'SCHEDULE_HOUR' => '3', 'SCHEDULE_DOW' => '0',
+    'HEADROOM_GB' => '10', 'PARALLEL' => '1', 'LANGUAGE' => 'auto', 'SCHEDULE' => 'off', 'SCHEDULE_HOUR' => '3', 'SCHEDULE_DOW' => '0',
 ];
 
 function read_cfg(): array {
@@ -54,6 +54,7 @@ function write_cfg(array $cfg): bool {
         'MIN_SIZE_MB' => 'Ignore folders whose biggest file is smaller',
         'LIMIT_GB' => 'Maximum data moved per run (0 = no cap)',
         'HEADROOM_GB' => 'Free space always left on a destination disk',
+        'PARALLEL' => 'Copies at once (1-4); each disk takes part in one copy at a time',
         'LANGUAGE' => 'WebGUI language: auto (same as Unraid), en or es',
         'SCHEDULE' => 'Automatic runs: off, daily, weekly or monthly',
         'SCHEDULE_HOUR' => 'Hour of the automatic run (0-23)',
@@ -285,6 +286,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'HEADROOM_GB'   => (string)max(1, min(1000, (int)($_POST['headroom_gb'] ?? 10))),
             'UNRAID_NOTIFY' => !empty($_POST['unraid_notify']) ? 'yes' : 'no',
             'WEBHOOK'       => $hook,
+            'PARALLEL'      => (string)max(1, min(4, (int)($_POST['parallel'] ?? 1))),
             'LANGUAGE'      => in_array($_POST['language'] ?? 'auto', ['auto', 'en', 'es'], true) ? $_POST['language'] : 'auto',
             'SCHEDULE'      => $sched,
             'SCHEDULE_HOUR' => (string)max(0, min(23, (int)($_POST['schedule_hour'] ?? 3))),
