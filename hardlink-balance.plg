@@ -2,8 +2,8 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name       "hardlink-balance">
   <!ENTITY author     "nemes">
-  <!ENTITY version    "2026.10.31c">
-  <!ENTITY commit     "55820dd3cdfd8fc721fdb4eedb567268a536ee3d">
+  <!ENTITY version    "2026.10.31d">
+  <!ENTITY commit     "2eb69c77c4e2e51762b6ece1491de87728b9b322">
   <!ENTITY raw        "https://raw.githubusercontent.com/&github;/&commit;">
   <!ENTITY github     "nemesbak/hardlink-balance">
   <!ENTITY pluginURL  "https://raw.githubusercontent.com/&github;/main/hardlink-balance.plg">
@@ -22,6 +22,10 @@
 >
 
 <CHANGES>
+##2026.10.31d
+- Disks below the target band now count: disks above the target keep giving data until no disk sits under the band.
+- Planning uses exact fill instead of whole percents.
+
 ##2026.10.31c
 - Parallel copies (Settings: Copies at once). Each disk takes part in one copy at a time; about 3x faster on arrays without parity.
 - Stop also ends the processes rsync forks; the engine never mistakes its own copies for another tool's.
@@ -83,7 +87,7 @@ mkdir -p &bootDir;/runs
 
 <FILE Name="&bootDir;/scripts/hardlink_balance.py">
 <URL>&raw;/scripts/hardlink_balance.py</URL>
-<MD5>bb3b55df02ff331f02170b8be1331a0b</MD5>
+<MD5>d6cc7b664b550bd65eaa4a5d4f3acd3e</MD5>
 </FILE>
 
 <FILE Name="&bootDir;/scripts/status.php">
