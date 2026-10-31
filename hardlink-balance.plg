@@ -2,8 +2,8 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name       "hardlink-balance">
   <!ENTITY author     "nemes">
-  <!ENTITY version    "2026.10.31">
-  <!ENTITY commit     "919fba43a141d88ba00fcdd5b5381af9af136ee4">
+  <!ENTITY version    "2026.10.31b">
+  <!ENTITY commit     "d405a8e00a710b830277b19e4c13b9bf7d40d58a">
   <!ENTITY raw        "https://raw.githubusercontent.com/&github;/&commit;">
   <!ENTITY github     "nemesbak/hardlink-balance">
   <!ENTITY pluginURL  "https://raw.githubusercontent.com/&github;/main/hardlink-balance.plg">
@@ -22,6 +22,13 @@
 >
 
 <CHANGES>
+##2026.10.31b
+- New WebGUI: disks against the target band with projected fill, live run panel, plan routes, safety checks, skipped folders, moves, history and log. Follows the Unraid theme.
+- Settings on the page: shares to balance, disks to leave alone, tolerance, minimum size, limit per run, recent-folder age, free space kept on destination.
+- Automatic runs (daily, weekly, monthly) and Unraid notifications.
+- English and Spanish; follows the Unraid language or a language chosen in Settings.
+- The Run button asks for confirmation; it is disabled while Mover, parity or another array copy is active.
+
 ##2026.10.31
 - Safety: the copy and its new directory entries are flushed to disk (fsync) before the source is removed.
 - Respects each share's included/excluded disks when choosing a destination.
@@ -66,17 +73,17 @@ mkdir -p &bootDir;/runs
 <!-- A file already on the flash with the right MD5 is not downloaded again: boots work offline. -->
 <FILE Name="&bootDir;/HardlinkBalance.page">
 <URL>&raw;/HardlinkBalance.page</URL>
-<MD5>ff911266d3f1183a13c13857c09195d6</MD5>
+<MD5>fdacb53cd7c3fbeeac559905dc3e883a</MD5>
 </FILE>
 
 <FILE Name="&bootDir;/scripts/hardlink_balance.py">
 <URL>&raw;/scripts/hardlink_balance.py</URL>
-<MD5>0d42e3fb221cd4c46461585269754922</MD5>
+<MD5>c277dcf4be830c7e9ada14d0095f38c8</MD5>
 </FILE>
 
 <FILE Name="&bootDir;/scripts/status.php">
 <URL>&raw;/scripts/status.php</URL>
-<MD5>b3b41094282542cf523187428f6754d4</MD5>
+<MD5>c33c75a2e2ceaded367991c52a04d209</MD5>
 </FILE>
 
 <FILE Name="&bootDir;/images/hardlink-balance.png">
@@ -108,6 +115,9 @@ if [[ ! -f &bootDir;/hardlink-balance.cfg ]]; then
   echo 'MIN_AGE_MIN="60"' >> &bootDir;/hardlink-balance.cfg
 fi
 
+# Re-register automatic runs (cron lives in RAM, the schedule on flash)
+if [[ -f &bootDir;/hardlink-balance.cron ]]; then /usr/local/sbin/update_cron; fi
+
 echo ""
 echo "-----------------------------------------------------------"
 echo " &name; has been installed successfully!"
@@ -127,6 +137,8 @@ if [[ -f /tmp/hardlink_balance.lock ]]; then
     rm -f /tmp/hardlink_balance.lock
 fi
 
+rm -f &bootDir;/hardlink-balance.cron
+/usr/local/sbin/update_cron
 rm -rf &pluginDir;
 # Keep settings and run history; drop only the cached program files
 rm -rf &bootDir;/scripts &bootDir;/images &bootDir;/HardlinkBalance.page
